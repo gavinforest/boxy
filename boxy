@@ -264,8 +264,38 @@ port_free() {
 state_dir_for() { printf '%s\n' "$BOXY_STATE_DIR/instances/$1"; }
 
 # Read a boxy label off a container.
+#
+# Labels are boxy's entire state store, so this is the hottest call in the
+# script — `boxy info` alone wants eight of them. Fetching one label per
+# `docker inspect` meant eight process spawns to print one box, so the whole
+# label set is fetched once and cached. A container's labels are fixed at
+# creation, which is what makes caching safe; the cache keys on the container
+# name and refetches whenever it changes.
+# The cache has to be filled by a call made as a PLAIN STATEMENT, never inside
+# `$( … )`. inst_label is always used in command substitution, and a subshell
+# can read the parent's variables but its writes die with it — so memoizing
+# inside inst_label itself would populate and discard the cache every time.
+_LBL_NAME=""
+_LBL_DATA=""
+inst_label_load() {
+    [ "$1" = "$_LBL_NAME" ] && return 0
+    _LBL_DATA="$(docker inspect -f '{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}
+{{end}}' "$1" 2>/dev/null || true)"
+    _LBL_NAME="$1"
+}
+
 inst_label() {
-    docker inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null || true
+    local name="$1" key="$2"
+    if [ "$name" != "$_LBL_NAME" ]; then
+        # Nobody preloaded this container: fall back to a single lookup so
+        # correctness never depends on remembering to call inst_label_load.
+        docker inspect -f "{{index .Config.Labels \"$key\"}}" "$name" 2>/dev/null || true
+        return 0
+    fi
+    # Exact prefix match at position 1, so `boxy.net` cannot be satisfied by
+    # some other label that merely contains that text.
+    printf '%s\n' "$_LBL_DATA" \
+        | awk -v k="$key=" 'index($0, k) == 1 { print substr($0, length(k) + 1); exit }'
 }
 
 # All boxy-managed container names, oldest first.
@@ -464,66 +494,120 @@ EOF
 
 cmd_create() {
     require_docker
+    nb_reset
+    # The only non-zero return from parsing is --help, which has already
+    # printed usage; anything genuinely wrong calls die() and exits.
+    if ! create_parse_args "$@"; then return 0; fi
+    create_validate
+    create_plan_ports
+    create_prepare_dirs
+    create_prepare_password
+    create_prepare_network
+    create_assemble_run_args
+    create_launch
+    create_report
+}
 
-    local mount_dir="" repo="" ref="" name="" password="" words="$BOXY_PASSWORD_WORDS"
-    local user="$BOXY_USER" pubkey="" git_key="$BOXY_GIT_KEY" no_git_key=0
-    local net="$BOXY_NET" image="$BOXY_IMAGE"
-    local use_ts=0 ts_host="" cpus="$BOXY_CPUS" memory="$BOXY_MEMORY"
-    local extra_allow=() extra_vols=() extra_envs=() publish=()
+# ---------------------------------------------------------------------------
+# create: the parameter block
+# ---------------------------------------------------------------------------
+# `boxy create` is a pipeline whose stages need to share about twenty values.
+# Bash functions return a status, not a struct, so the choice is a documented
+# block of globals or one 300-line function. This is the former: every field
+# is prefixed NB_ ("new box"), written only by create_* functions, and cleared
+# at the start of every run so nothing leaks between invocations.
+nb_reset() {
+    NB_MOUNT_DIR=""; NB_REPO=""; NB_REF=""; NB_NAME=""
+    NB_PASSWORD=""; NB_PW_HASH=""; NB_PW_GENERATED=0
+    NB_WORDS="$BOXY_PASSWORD_WORDS"; NB_USER="$BOXY_USER"; NB_PUBKEY=""
+    NB_GIT_KEY="$BOXY_GIT_KEY"; NB_NO_GIT_KEY=0
+    NB_NET="$BOXY_NET"; NB_IMAGE="$BOXY_IMAGE"
+    NB_USE_TS=0; NB_TS_HOST=""; NB_CPUS="$BOXY_CPUS"; NB_MEMORY="$BOXY_MEMORY"
+    NB_IDX=""; NB_SSH_PORT=""; NB_PUBLISHED=""
+    NB_SDIR=""; NB_WORKDIR=""; NB_AUTHORIZED_KEYS=""
+    NB_NET_NAME=""; NB_PROXY_NAME=""; NB_PROXY_URL=""
+    NB_ALLOW=(); NB_VOLS=(); NB_ENVS=(); NB_PUBLISH=()
+    RUN_ARGS=()
+}
 
+# Append to the docker-run argument vector.
+#
+# bash 3.2 has no `arr+=(x)`, so without this helper every single docker flag
+# costs two lines of `RUN_ARGS[${#RUN_ARGS[@]}]=` noise — which was 37 lines of
+# pure boilerplate in the original.
+arg() { while [ $# -gt 0 ]; do RUN_ARGS[${#RUN_ARGS[@]}]="$1"; shift; done; }
+
+# Append to an NB_ list. Same reason.
+nb_push_allow()   { NB_ALLOW[${#NB_ALLOW[@]}]="$1"; }
+nb_push_vol()     { NB_VOLS[${#NB_VOLS[@]}]="$1"; }
+nb_push_env()     { NB_ENVS[${#NB_ENVS[@]}]="$1"; }
+nb_push_publish() { NB_PUBLISH[${#NB_PUBLISH[@]}]="$1"; }
+
+# ---------------------------------------------------------------------------
+# create: stages
+# ---------------------------------------------------------------------------
+
+# Returns non-zero only for --help.
+create_parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            -d|--dir)       mount_dir="${2:?--dir needs a value}"; shift 2 ;;
-            -r|--repo)      repo="${2:?--repo needs a value}"; shift 2 ;;
-            -b|--ref)       ref="${2:?--ref needs a value}"; shift 2 ;;
-            -n|--name)      name="${2:?--name needs a value}"; shift 2 ;;
-            --password)     password="${2:?--password needs a value}"; shift 2 ;;
-            --words)        words="${2:?--words needs a value}"; shift 2 ;;
-            -u|--user)      user="${2:?--user needs a value}"; shift 2 ;;
-            -k|--key)       pubkey="${2:?--key needs a value}"; shift 2 ;;
-            --git-key)      git_key="${2:?--git-key needs a value}"; shift 2 ;;
-            --no-git-key)   no_git_key=1; shift ;;
-            --net)          net="${2:?--net needs a value}"; shift 2 ;;
-            --allow)        extra_allow[${#extra_allow[@]}]="${2:?--allow needs a value}"; shift 2 ;;
-            -p|--publish)   publish[${#publish[@]}]="${2:?--publish needs a value}"; shift 2 ;;
-            -v|--volume)    extra_vols[${#extra_vols[@]}]="${2:?--volume needs a value}"; shift 2 ;;
-            -e|--env)       extra_envs[${#extra_envs[@]}]="${2:?--env needs a value}"; shift 2 ;;
-            --tailscale)    use_ts=1; shift ;;
-            --ts-hostname)  ts_host="${2:?--ts-hostname needs a value}"; shift 2 ;;
-            --image)        image="${2:?--image needs a value}"; shift 2 ;;
-            --cpus)         cpus="${2:?--cpus needs a value}"; shift 2 ;;
-            --memory)       memory="${2:?--memory needs a value}"; shift 2 ;;
-            -h|--help)      usage_create; return 0 ;;
+            -d|--dir)       NB_MOUNT_DIR="${2:?--dir needs a value}";      shift 2 ;;
+            -r|--repo)      NB_REPO="${2:?--repo needs a value}";          shift 2 ;;
+            -b|--ref)       NB_REF="${2:?--ref needs a value}";            shift 2 ;;
+            -n|--name)      NB_NAME="${2:?--name needs a value}";          shift 2 ;;
+            --password)     NB_PASSWORD="${2:?--password needs a value}";  shift 2 ;;
+            --words)        NB_WORDS="${2:?--words needs a value}";        shift 2 ;;
+            -u|--user)      NB_USER="${2:?--user needs a value}";          shift 2 ;;
+            -k|--key)       NB_PUBKEY="${2:?--key needs a value}";         shift 2 ;;
+            --git-key)      NB_GIT_KEY="${2:?--git-key needs a value}";    shift 2 ;;
+            --no-git-key)   NB_NO_GIT_KEY=1;                               shift ;;
+            --net)          NB_NET="${2:?--net needs a value}";            shift 2 ;;
+            --allow)        nb_push_allow   "${2:?--allow needs a value}"; shift 2 ;;
+            -p|--publish)   nb_push_publish "${2:?--publish needs a value}"; shift 2 ;;
+            -v|--volume)    nb_push_vol     "${2:?--volume needs a value}"; shift 2 ;;
+            -e|--env)       nb_push_env     "${2:?--env needs a value}";   shift 2 ;;
+            --tailscale)    NB_USE_TS=1;                                   shift ;;
+            --ts-hostname)  NB_TS_HOST="${2:?--ts-hostname needs a value}"; shift 2 ;;
+            --image)        NB_IMAGE="${2:?--image needs a value}";        shift 2 ;;
+            --cpus)         NB_CPUS="${2:?--cpus needs a value}";          shift 2 ;;
+            --memory)       NB_MEMORY="${2:?--memory needs a value}";      shift 2 ;;
+            -h|--help)      usage_create; return 1 ;;
             *)              die "create: unknown option $1 (try 'boxy create --help')" ;;
         esac
     done
+    return 0
+}
 
-    case "$net" in
+create_validate() {
+    case "$NB_NET" in
         full|none|limited) ;;
         *) die "--net must be one of: full, none, limited" ;;
     esac
-    [ -n "$mount_dir" ] && [ -n "$repo" ] \
-        && die "--dir and --repo are mutually exclusive (mount a dir, or clone into a fresh one)"
+    if [ -n "$NB_MOUNT_DIR" ] && [ -n "$NB_REPO" ]; then
+        die "--dir and --repo are mutually exclusive (mount a dir, or clone into a fresh one)"
+    fi
 
-    image_exists "$image" || die "image '$image' not found — run: boxy build"
-    if [ "$net" = "limited" ]; then
+    image_exists "$NB_IMAGE" || die "image '$NB_IMAGE' not found — run: boxy build"
+    if [ "$NB_NET" = "limited" ]; then
         image_exists "$BOXY_PROXY_IMAGE" \
             || die "proxy image '$BOXY_PROXY_IMAGE' not found — run: boxy build"
         ensure_allowlist
     fi
 
     ensure_ssh_key
-    [ -n "$pubkey" ] || pubkey="$BOXY_SSH_KEY.pub"
-    [ -f "$pubkey" ] || die "public key not found: $pubkey"
-    local authorized_keys
-    authorized_keys="$(cat "$pubkey")"
+    [ -n "$NB_PUBKEY" ] || NB_PUBKEY="$BOXY_SSH_KEY.pub"
+    [ -f "$NB_PUBKEY" ] || die "public key not found: $NB_PUBKEY"
+    NB_AUTHORIZED_KEYS="$(cat "$NB_PUBKEY")"
+}
 
-    # ---- normalise -p specs into host:container pairs --------------------
-    # `-p 2718` means the same number on both sides; `-p 12718:2718` states it
-    # explicitly. Either way the mapping is declared, never inferred from a
-    # port's position in some list.
-    local spec hp cp published_map=""
-    for spec in ${publish[@]+"${publish[@]}"}; do
+# Normalise -p specs, then claim an instance index and its SSH port.
+#
+# `-p 2718` means the same number on both sides; `-p 12718:2718` states it
+# explicitly. Either way the mapping is declared, never inferred from a port's
+# position in some list.
+create_plan_ports() {
+    local spec hp cp
+    for spec in ${NB_PUBLISH[@]+"${NB_PUBLISH[@]}"}; do
         case "$spec" in
             *:*) hp="${spec%%:*}"; cp="${spec##*:}" ;;
             *)   hp="$spec";       cp="$spec" ;;
@@ -531,156 +615,141 @@ cmd_create() {
         printf '%s' "$hp$cp" | grep -qE '^[0-9]+$' \
             || die "--publish: expected PORT or HOSTPORT:PORT, got '$spec'"
         port_free "$hp" || die "--publish $spec: host port $hp is already in use"
-        published_map="$published_map $hp:$cp"
+        NB_PUBLISHED="$NB_PUBLISHED $hp:$cp"
     done
-    published_map="${published_map# }"
+    NB_PUBLISHED="${NB_PUBLISHED# }"
 
-    # ---- allocate an instance index, and with it the SSH port ------------
-    local used_idx idx=1 ssh_port
+    local used_idx idx=1
     used_idx="$(for c in $(list_instances); do inst_label "$c" boxy.index; done)"
     while :; do
-        ssh_port=$(( BOXY_SSH_PORT_BASE + idx - 1 ))
-        if ! printf '%s\n' "$used_idx" | grep -qx "$idx" && port_free "$ssh_port"; then
+        NB_SSH_PORT=$(( BOXY_SSH_PORT_BASE + idx - 1 ))
+        if ! printf '%s\n' "$used_idx" | grep -qx "$idx" && port_free "$NB_SSH_PORT"; then
             break
         fi
         idx=$(( idx + 1 ))
         [ "$idx" -gt 200 ] && die "could not find a free instance slot below 200"
     done
+    NB_IDX="$idx"
 
-    [ -n "$name" ] || name="boxy-$idx"
-    instance_exists "$name" && die "instance '$name' already exists"
+    [ -n "$NB_NAME" ] || NB_NAME="boxy-$NB_IDX"
+    instance_exists "$NB_NAME" && die "instance '$NB_NAME' already exists"
+    return 0
+}
 
-    # ---- state -----------------------------------------------------------
-    # Bookkeeping only: host keys, known_hosts, the password file. It exists
-    # for exactly as long as the container does and `boxy rm` deletes it.
-    local sdir
-    sdir="$(state_dir_for "$name")"
-    mkdir -p "$sdir/hostkeys"
-    chmod 700 "$sdir"
+create_prepare_dirs() {
+    # State is bookkeeping only — host keys, known_hosts, the password file.
+    # It lives exactly as long as the container does; `boxy rm` deletes it.
+    NB_SDIR="$(state_dir_for "$NB_NAME")"
+    mkdir -p "$NB_SDIR/hostkeys"
+    chmod 700 "$NB_SDIR"
 
     # A -d directory is yours: mounted as-is, never created, never removed.
     # Otherwise the box gets fresh scratch space in the OS temp area. mktemp
     # rather than a fixed path per name, so a recreated box never inherits a
-    # previous one's leftovers (which would, among other things, silently skip
-    # a --repo clone because the workdir looked non-empty).
-    local workdir_host
-    if [ -n "$mount_dir" ]; then
-        [ -d "$mount_dir" ] || die "not a directory: $mount_dir"
-        workdir_host="$(cd "$mount_dir" && pwd)"
+    # previous one's leftovers — which would, among other things, silently
+    # skip a --repo clone because the workdir looked non-empty.
+    if [ -n "$NB_MOUNT_DIR" ]; then
+        [ -d "$NB_MOUNT_DIR" ] || die "not a directory: $NB_MOUNT_DIR"
+        NB_WORKDIR="$(cd "$NB_MOUNT_DIR" && pwd)"
     else
         mkdir -p "$BOXY_WORKDIR_BASE"
-        workdir_host="$(mktemp -d "$BOXY_WORKDIR_BASE/$name.XXXXXX")" \
+        NB_WORKDIR="$(mktemp -d "$BOXY_WORKDIR_BASE/$NB_NAME.XXXXXX")" \
             || die "could not create a workdir under $BOXY_WORKDIR_BASE"
     fi
+}
 
-    # ---- password --------------------------------------------------------
-    local generated=0
-    if [ -z "$password" ]; then
-        password="$(gen_password "$words")"
-        generated=1
+create_prepare_password() {
+    if [ -z "$NB_PASSWORD" ]; then
+        NB_PASSWORD="$(gen_password "$NB_WORDS")"
+        NB_PW_GENERATED=1
     fi
-    local pw_hash
-    pw_hash="$(hash_password "$password")"
-    [ -n "$pw_hash" ] || die "password hashing produced nothing"
+    NB_PW_HASH="$(hash_password "$NB_PASSWORD")"
+    [ -n "$NB_PW_HASH" ] || die "password hashing produced nothing"
 
     # Plaintext stays here, host-side, 0600 — never handed to the container.
-    ( umask 077; printf '%s\n' "$password" > "$sdir/password" )
+    ( umask 077; printf '%s\n' "$NB_PASSWORD" > "$NB_SDIR/password" )
+}
 
-    # ---- networking ------------------------------------------------------
-    local net_name="" proxy_name="" proxy_url="" run_net
-    case "$net" in
-        full)
-            net_name="boxy-net"
-            ensure_network "$net_name"
-            ;;
-        none)
-            net_name="boxy-iso-$name"
-            ensure_network "$net_name"
-            ;;
-        limited)
-            net_name="boxy-iso-$name"
-            ensure_network "$net_name"
-            ensure_network "boxy-egress"
-            proxy_name="boxy-proxy-$name"
-            proxy_url="http://$proxy_name:8888"
-
-            local allowlist
-            allowlist="$(grep -v '^[[:space:]]*#' "$(allowlist_file)" | grep -v '^[[:space:]]*$' || true)"
-            local a
-            for a in ${extra_allow[@]+"${extra_allow[@]}"}; do
-                allowlist="$allowlist
-$a"
-            done
-            [ -n "$allowlist" ] || die "egress allowlist is empty; nothing would be reachable"
-
-            info "starting egress proxy $proxy_name"
-            docker run -d \
-                --name "$proxy_name" \
-                --hostname "$proxy_name" \
-                --restart "$BOXY_RESTART" \
-                --network "boxy-egress" \
-                --label boxy.managed=1 \
-                --label boxy.role=proxy \
-                --label "boxy.instance=$name" \
-                -e "BOXY_ALLOWLIST=$allowlist" \
-                "$BOXY_PROXY_IMAGE" >/dev/null
-            # Second attachment: the proxy is now reachable by name from the
-            # box's internal network while keeping its own route out.
-            docker network connect "$net_name" "$proxy_name"
-            ;;
+create_prepare_network() {
+    case "$NB_NET" in
+        full)    NB_NET_NAME="boxy-net" ;;
+        *)       NB_NET_NAME="boxy-iso-$NB_NAME" ;;
     esac
-    run_net="$net_name"
+    ensure_network "$NB_NET_NAME"
+    [ "$NB_NET" = "limited" ] || return 0
 
-    # ---- assemble docker run --------------------------------------------
-    local args=()
-    args[${#args[@]}]="-d"
-    args[${#args[@]}]="--name";     args[${#args[@]}]="$name"
-    args[${#args[@]}]="--hostname"; args[${#args[@]}]="$name"
-    args[${#args[@]}]="--restart";  args[${#args[@]}]="$BOXY_RESTART"
-    args[${#args[@]}]="--network";  args[${#args[@]}]="$run_net"
+    ensure_network "boxy-egress"
+    NB_PROXY_NAME="boxy-proxy-$NB_NAME"
+    NB_PROXY_URL="http://$NB_PROXY_NAME:8888"
 
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.managed=1"
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.role=box"
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.index=$idx"
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.ssh_port=$ssh_port"
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.published=$published_map"
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.workdir=$workdir_host"
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.net=$net"
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.user=$user"
-    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local allowlist a
+    allowlist="$(grep -v '^[[:space:]]*#' "$(allowlist_file)" | grep -v '^[[:space:]]*$' || true)"
+    for a in ${NB_ALLOW[@]+"${NB_ALLOW[@]}"}; do
+        allowlist="$allowlist
+$a"
+    done
+    [ -n "$allowlist" ] || die "egress allowlist is empty; nothing would be reachable"
 
-    args[${#args[@]}]="-p"; args[${#args[@]}]="$BOXY_BIND_ADDR:$ssh_port:22"
+    info "starting egress proxy $NB_PROXY_NAME"
+    docker run -d \
+        --name "$NB_PROXY_NAME" \
+        --hostname "$NB_PROXY_NAME" \
+        --restart "$BOXY_RESTART" \
+        --network "boxy-egress" \
+        --label boxy.managed=1 \
+        --label boxy.role=proxy \
+        --label "boxy.instance=$NB_NAME" \
+        -e "BOXY_ALLOWLIST=$allowlist" \
+        "$BOXY_PROXY_IMAGE" >/dev/null
+    # Second attachment: the proxy becomes reachable by name from the box's
+    # isolated network while keeping its own route out.
+    docker network connect "$NB_NET_NAME" "$NB_PROXY_NAME"
+}
+
+create_assemble_run_args() {
+    arg -d
+    arg --name "$NB_NAME" --hostname "$NB_NAME"
+    arg --restart "$BOXY_RESTART" --network "$NB_NET_NAME"
+
+    # Labels are boxy's entire state store — see inst_label().
+    arg --label "boxy.managed=1"
+    arg --label "boxy.role=box"
+    arg --label "boxy.index=$NB_IDX"
+    arg --label "boxy.ssh_port=$NB_SSH_PORT"
+    arg --label "boxy.published=$NB_PUBLISHED"
+    arg --label "boxy.workdir=$NB_WORKDIR"
+    arg --label "boxy.net=$NB_NET"
+    arg --label "boxy.user=$NB_USER"
+    arg --label "boxy.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    arg -p "$BOXY_BIND_ADDR:$NB_SSH_PORT:22"
     local pair
-    for pair in $published_map; do
-        args[${#args[@]}]="-p"
-        args[${#args[@]}]="$BOXY_BIND_ADDR:${pair%%:*}:${pair##*:}"
+    for pair in $NB_PUBLISHED; do
+        arg -p "$BOXY_BIND_ADDR:${pair%%:*}:${pair##*:}"
     done
 
-    args[${#args[@]}]="-v"; args[${#args[@]}]="$workdir_host:/work"
-    args[${#args[@]}]="-v"; args[${#args[@]}]="$sdir/hostkeys:/etc/ssh/hostkeys"
-
-    if [ "$no_git_key" = "0" ] && [ -n "$git_key" ] && [ -f "$git_key" ]; then
-        args[${#args[@]}]="-v"; args[${#args[@]}]="$git_key:/run/secrets/git_key:ro"
-    elif [ "$no_git_key" = "0" ] && [ -n "$git_key" ]; then
-        warn "git key $git_key not found — the box will have no git credentials"
+    arg -v "$NB_WORKDIR:/work"
+    arg -v "$NB_SDIR/hostkeys:/etc/ssh/hostkeys"
+    if [ "$NB_NO_GIT_KEY" = "0" ] && [ -n "$NB_GIT_KEY" ]; then
+        if [ -f "$NB_GIT_KEY" ]; then
+            arg -v "$NB_GIT_KEY:/run/secrets/git_key:ro"
+        else
+            warn "git key $NB_GIT_KEY not found — the box will have no git credentials"
+        fi
     fi
-
     local v
-    for v in ${extra_vols[@]+"${extra_vols[@]}"}; do
-        args[${#args[@]}]="-v"; args[${#args[@]}]="$v"
-    done
+    for v in ${NB_VOLS[@]+"${NB_VOLS[@]}"}; do arg -v "$v"; done
 
-    args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_NAME=$name"
-    args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_USER=$user"
-    args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_AUTHORIZED_KEYS=$authorized_keys"
-    args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_PASSWORD_HASH=$pw_hash"
-    [ -n "$repo" ] && { args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_REPO=$repo"; }
-    [ -n "$ref" ]  && { args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_REPO_REF=$ref"; }
-    [ -n "$proxy_url" ] && { args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_PROXY_URL=$proxy_url"; }
+    arg -e "BOXY_NAME=$NB_NAME"
+    arg -e "BOXY_USER=$NB_USER"
+    arg -e "BOXY_AUTHORIZED_KEYS=$NB_AUTHORIZED_KEYS"
+    arg -e "BOXY_PASSWORD_HASH=$NB_PW_HASH"
+    [ -n "$NB_REPO" ]      && arg -e "BOXY_REPO=$NB_REPO"
+    [ -n "$NB_REF" ]       && arg -e "BOXY_REPO_REF=$NB_REF"
+    [ -n "$NB_PROXY_URL" ] && arg -e "BOXY_PROXY_URL=$NB_PROXY_URL"
+
     # Tell the entrypoint to block on the isolation marker before it clones.
-    if [ "$net" != "full" ]; then
-        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_AWAIT_NETWORK=1"
-    fi
+    [ "$NB_NET" != "full" ] && arg -e "BOXY_AWAIT_NETWORK=1"
 
     # Match the host user's ids so bind-mounted files are not owned by a
     # stranger — but only on Linux, where a bind mount passes numeric
@@ -688,69 +757,73 @@ $a"
     # presents mounted files as the container user, so remapping there buys
     # nothing and costs a multi-minute recursive chown of the conda prefix.
     if [ "$(uname -s)" = "Linux" ]; then
-        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_UID=$(id -u)"
-        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_GID=$(id -g)"
+        arg -e "BOXY_UID=$(id -u)" -e "BOXY_GID=$(id -g)"
     fi
 
-    if [ "$use_ts" = "1" ]; then
+    if [ "$NB_USE_TS" = "1" ]; then
         [ -n "$BOXY_TS_AUTHKEY" ] || die "--tailscale needs BOXY_TS_AUTHKEY (config or environment)"
-        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_TS_AUTHKEY=$BOXY_TS_AUTHKEY"
-        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_TS_HOSTNAME=${ts_host:-$name}"
+        arg -e "BOXY_TS_AUTHKEY=$BOXY_TS_AUTHKEY"
+        arg -e "BOXY_TS_HOSTNAME=${NB_TS_HOST:-$NB_NAME}"
     fi
-
     local ev
-    for ev in ${extra_envs[@]+"${extra_envs[@]}"}; do
-        args[${#args[@]}]="-e"; args[${#args[@]}]="$ev"
-    done
+    for ev in ${NB_ENVS[@]+"${NB_ENVS[@]}"}; do arg -e "$ev"; done
 
-    [ -n "$cpus" ]   && { args[${#args[@]}]="--cpus"; args[${#args[@]}]="$cpus"; }
-    [ -n "$memory" ] && { args[${#args[@]}]="--memory"; args[${#args[@]}]="$memory"; }
+    [ -n "$NB_CPUS" ]   && arg --cpus "$NB_CPUS"
+    [ -n "$NB_MEMORY" ] && arg --memory "$NB_MEMORY"
+    return 0
+}
 
-    if ! docker run "${args[@]}" "$image" >/dev/null; then
-        [ -n "$proxy_name" ] && docker rm -f "$proxy_name" >/dev/null 2>&1
-        [ "$net" != "full" ] && remove_network_if_unused "$net_name"
+create_launch() {
+    if ! docker run "${RUN_ARGS[@]}" "$NB_IMAGE" >/dev/null; then
+        # Roll back anything this run created, so a failed create does not
+        # leave a half-built box behind.
+        [ -n "$NB_PROXY_NAME" ] && docker rm -f "$NB_PROXY_NAME" >/dev/null 2>&1
+        [ "$NB_NET" != "full" ] && remove_network_if_unused "$NB_NET_NAME"
         die "docker run failed"
     fi
 
-    # ---- cut egress before anything in the box can use it ----------------
-    if [ "$net" != "full" ]; then
-        isolate_network "$name" || true
-    fi
+    # Cut egress before anything inside the box can use it.
+    [ "$NB_NET" != "full" ] && { isolate_network "$NB_NAME" || true; }
 
-    # ---- wait for a real SSH handshake, pinning the host key on the way ---
-    if ! wait_for_ready "$name"; then
+    if ! wait_for_ready "$NB_NAME"; then
         warn "the box did not become SSH-reachable within the timeout. Recent logs:"
-        docker logs --tail 30 "$name" >&2 || true
-        warn "'boxy exec $name' works without SSH and is the quickest way in."
+        docker logs --tail 30 "$NB_NAME" >&2 || true
+        warn "'boxy exec $NB_NAME' works without SSH and is the quickest way in."
     fi
+    return 0
+}
 
-    # ---- report ----------------------------------------------------------
+create_report() {
+    local pair
     printf '\n'
-    ok "created instance $idx ($name), ssh at port $ssh_port"
+    ok "created instance $NB_IDX ($NB_NAME), ssh at port $NB_SSH_PORT"
     printf '  %sssh%s     ssh -F %s %s        %s(or: boxy ssh %s)%s\n' \
-        "$C_BLD" "$C_OFF" "$(ssh_config_path)" "$name" "$C_DIM" "$name" "$C_OFF"
+        "$C_BLD" "$C_OFF" "$(ssh_config_path)" "$NB_NAME" "$C_DIM" "$NB_NAME" "$C_OFF"
     printf '  %sdirect%s  ssh -p %s -i %s %s@%s\n' \
-        "$C_BLD" "$C_OFF" "$ssh_port" "$BOXY_SSH_KEY" "$user" "$BOXY_SSH_HOST"
-    printf '  %sworkdir%s %s -> /work\n' "$C_BLD" "$C_OFF" "$workdir_host"
-    printf '  %snet%s     %s' "$C_BLD" "$C_OFF" "$net"
-    [ -n "$proxy_url" ] && printf ' (proxy %s)' "$proxy_name"
+        "$C_BLD" "$C_OFF" "$NB_SSH_PORT" "$BOXY_SSH_KEY" "$NB_USER" "$BOXY_SSH_HOST"
+    printf '  %sworkdir%s %s -> /work\n' "$C_BLD" "$C_OFF" "$NB_WORKDIR"
+
+    printf '  %snet%s     %s' "$C_BLD" "$C_OFF" "$NB_NET"
+    [ -n "$NB_PROXY_URL" ] && printf ' (proxy %s)' "$NB_PROXY_NAME"
     printf '\n'
-    if [ "$generated" = "1" ]; then
+
+    if [ "$NB_PW_GENERATED" = "1" ]; then
         printf '  %ssudo pw%s %s   %s(boxy password %s)%s\n' \
-            "$C_BLD" "$C_OFF" "$password" "$C_DIM" "$name" "$C_OFF"
+            "$C_BLD" "$C_OFF" "$NB_PASSWORD" "$C_DIM" "$NB_NAME" "$C_OFF"
     else
         printf '  %ssudo pw%s (as supplied)   %s(boxy password %s)%s\n' \
-            "$C_BLD" "$C_OFF" "$C_DIM" "$name" "$C_OFF"
+            "$C_BLD" "$C_OFF" "$C_DIM" "$NB_NAME" "$C_OFF"
     fi
-    if [ -n "$published_map" ]; then
+
+    if [ -n "$NB_PUBLISHED" ]; then
         printf '  %sports%s   ' "$C_BLD" "$C_OFF"
-        for pair in $published_map; do
+        for pair in $NB_PUBLISHED; do
             printf 'localhost:%s -> %s   ' "${pair%%:*}" "${pair##*:}"
         done
         printf '\n'
     else
         printf '  %sports%s   none published — %sboxy forward %s%s tunnels %s\n' \
-            "$C_BLD" "$C_OFF" "$C_DIM" "$name" "$C_OFF" "$BOXY_PORTS"
+            "$C_BLD" "$C_OFF" "$C_DIM" "$NB_NAME" "$C_OFF" "$BOXY_PORTS"
     fi
     write_ssh_config >/dev/null
 }
@@ -828,6 +901,7 @@ write_ssh_config() {
         printf '# Generated by boxy %s — regenerated on every create/rm.\n' "$BOXY_VERSION"
         printf '# Do not edit; put overrides in %s.\n\n' "$BOXY_CONFIG_FILE"
         for name in $(list_instances); do
+            inst_label_load "$name"
             [ "$(inst_label "$name" boxy.role)" = "box" ] || continue
             port="$(inst_label "$name" boxy.ssh_port)"
             user="$(inst_label "$name" boxy.user)"
@@ -899,6 +973,7 @@ cmd_ls() {
     printf '%-12s %-9s %-6s %-8s %s\n' NAME STATUS SSH NET WORKDIR
     local n status
     for n in $names; do
+        inst_label_load "$n"
         [ "$(inst_label "$n" boxy.role)" = "box" ] || continue
         status="$(docker inspect -f '{{.State.Status}}' "$n")"
         printf '%-12s %-9s %-6s %-8s %s\n' \
@@ -912,6 +987,7 @@ cmd_ls() {
 cmd_info() {
     require_docker
     local name; name="$(resolve_instance "${1:-}")"
+    inst_label_load "$name"
     local sdir; sdir="$(state_dir_for "$name")"
     local pubmap; pubmap="$(inst_label "$name" boxy.published)"
     printf 'name        %s\n' "$name"
@@ -1105,6 +1181,7 @@ cmd_rm() {
     local name sdir workdir net
     for name in "${names[@]}"; do
         require_instance "$name"
+        inst_label_load "$name"
         sdir="$(state_dir_for "$name")"
         workdir="$(inst_label "$name" boxy.workdir)"
         net="$(inst_label "$name" boxy.net)"
