@@ -1,0 +1,8 @@
+# Never commit a real config — it can carry a tailscale auth key.
+config
+*.local
+
+# Local scratch
+.DS_Store
+*.swp
+*.tmp

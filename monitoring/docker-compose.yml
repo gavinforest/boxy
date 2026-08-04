@@ -1,0 +1,109 @@
+# boxy monitoring — cAdvisor + node-exporter + Prometheus + Grafana.
+#
+#   boxy monitor up      →  Grafana on http://localhost:3001 (admin/admin)
+#   boxy monitor down
+#
+# This is deliberately host-scoped rather than per-box: cAdvisor reads the
+# cgroup tree, so it discovers every boxy container automatically and keeps
+# reporting on them as they come and go. Nothing needs to be installed inside
+# a box, which matters when the boxes are meant to be disposable.
+#
+# On a Linux VPS this works as-is. On Docker Desktop for macOS, cAdvisor sees
+# the Linux VM rather than macOS, so host metrics describe the VM — container
+# metrics are still accurate.
+
+name: boxy-monitoring
+
+services:
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: boxy-cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      # The Docker socket specifically — NOT /var/run as a whole. Without a
+      # working connection to the daemon, cAdvisor still collects cgroup
+      # metrics but cannot map cgroup ids to container names, so every series
+      # comes through with name="" and the dashboards below match nothing.
+      # (This is an admin-level socket; cAdvisor is already privileged.)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    command:
+      - --housekeeping_interval=15s
+      # Trim the default firehose of per-container metrics down to the ones
+      # the dashboards actually use; cAdvisor's full set is expensive to
+      # scrape and store for a handful of dev boxes.
+      - --disable_metrics=percpu,sched,process,hugetlb,referenced_memory,tcp,udp,advtcp,cpu_topology,resctrl
+      # Keep boxy's labels (the dashboards select on boxy.role, which is the
+      # only reliable way to tell a box from a proxy sidecar or from the
+      # monitoring stack's own containers) and drop everything else — the full
+      # label set is a cardinality problem for no benefit.
+      - --store_container_labels=false
+      - --whitelisted_container_labels=boxy.role,boxy.index,boxy.net
+    networks: [boxy-mon]
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: boxy-node-exporter
+    restart: unless-stopped
+    pid: host
+    volumes:
+      # Plain :ro, not :ro,rslave. rslave gives better fidelity on a Linux
+      # host (submounts created later stay visible), but Docker Desktop's VM
+      # root is neither shared nor slave and the container refuses to start.
+      # On a dedicated Linux VPS you can append ,rslave here.
+      - /:/host:ro
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    networks: [boxy-mon]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: boxy-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [boxy-mon]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: boxy-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GF_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GF_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      # Loopback only. Reach it over tailscale or an SSH tunnel on a VPS —
+      # a default-credentials Grafana on a public port is a bad afternoon.
+      - "127.0.0.1:3001:3000"
+    depends_on: [prometheus]
+    networks: [boxy-mon]
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  boxy-mon:
+    name: boxy-mon

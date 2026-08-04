@@ -1,0 +1,68 @@
+# boxy sshd_config
+#
+# Key-only. There is a user password inside the box, but it exists solely to
+# gate sudo — it is never accepted by sshd. That keeps a box exposed on a
+# public VPS from being brute-forceable.
+
+# Include comes first on purpose: sshd takes the FIRST value it obtains for
+# most keywords, so runtime overrides written by the entrypoint (e.g. an
+# AllowUsers line pinned to the configured box user) must be parsed before the
+# baked-in defaults below.
+Include /etc/ssh/sshd_config.d/*.conf
+
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+# Host keys live on a bind mount from per-instance state, so recreating a box
+# does not change its fingerprint.
+HostKey /etc/ssh/hostkeys/ssh_host_ed25519_key
+HostKey /etc/ssh/hostkeys/ssh_host_rsa_key
+
+# --- Authentication -------------------------------------------------------
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+GSSAPIAuthentication no
+HostbasedAuthentication no
+PermitRootLogin no
+
+LoginGraceTime 30
+MaxAuthTries 3
+MaxSessions 20
+StrictModes yes
+
+# UsePAM stays on for session setup (pam_limits, motd, loginuid). With every
+# PAM-driven auth path above disabled, it grants no password route in.
+UsePAM yes
+
+# --- Forwarding -----------------------------------------------------------
+# TCP forwarding is the whole point: `boxy forward` uses -L to pipe container
+# ports through to identical localhost port numbers. GatewayPorts stays off so
+# those tunnels are not re-exported to the network.
+AllowTcpForwarding yes
+GatewayPorts no
+AllowAgentForwarding yes
+PermitTunnel no
+X11Forwarding no
+
+# --- Session --------------------------------------------------------------
+PermitTTY yes
+PrintMotd no
+PrintLastLog yes
+TCPKeepAlive yes
+ClientAliveInterval 60
+ClientAliveCountMax 5
+UseDNS no
+Compression no
+MaxStartups 10:30:60
+
+AcceptEnv LANG LC_*
+PermitUserEnvironment no
+
+Subsystem sftp /usr/lib/openssh/sftp-server

@@ -1,0 +1,1319 @@
+#!/usr/bin/env bash
+#
+# boxy — disposable, SSH-reachable dev boxes backed by Docker.
+#
+#   boxy create -d /volume/to/mount
+#   boxy create -r git@github.com:you/repo.git
+#   boxy ls
+#   boxy ssh boxy-1
+#
+# Written for bash 3.2 (the macOS system bash), so: no associative arrays,
+# no mapfile, no ${x,,}. Docker labels are the source of truth for instance
+# state — there is no separate database to drift out of sync.
+
+set -euo pipefail
+
+BOXY_VERSION="1.0.0"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ===========================================================================
+# Configuration
+# ===========================================================================
+# Precedence: built-in defaults < config file < BOXY_* environment < flags.
+
+BOXY_CONFIG_DIR="${BOXY_CONFIG_DIR:-$HOME/.config/boxy}"
+BOXY_CONFIG_FILE="${BOXY_CONFIG_FILE:-$BOXY_CONFIG_DIR/config}"
+
+# Defaults, applied only where the config file / environment leave a gap.
+: "${BOXY_STATE_DIR:=$HOME/.local/share/boxy}"
+: "${BOXY_IMAGE:=boxy:latest}"
+: "${BOXY_PROXY_IMAGE:=boxy-proxy:latest}"
+: "${BOXY_USER:=boxyboy}"
+
+# Key mounted into the box so git can talk to GitHub. Empty disables it.
+: "${BOXY_GIT_KEY:=$HOME/.ssh/id_ed25519}"
+
+# Where a box's workdir goes when you don't pass -d. The OS reaps temp
+# directories on its own schedule, which is the right owner for scratch space:
+# boxy neither tracks it nor deletes it, so there is no lifecycle to reason
+# about. A directory you pass with -d is yours and is never touched.
+# (macOS sets TMPDIR with a trailing slash, hence the %/.)
+_BOXY_TMP="${TMPDIR:-/tmp}"
+: "${BOXY_WORKDIR_BASE:=${_BOXY_TMP%/}/boxy}"
+unset _BOXY_TMP
+
+: "${BOXY_SSH_PORT_BASE:=2200}"
+
+# The "known set of ports" that `boxy forward` tunnels when you don't name any.
+# These are NOT published to the host automatically — publishing is explicit
+# (`-p`), because an implicit host->container mapping you have to decode from a
+# list's ordering is worse than no mapping at all.
+: "${BOXY_PORTS:=2718 8888 8000 8080 3000 5000 6006}"
+
+# Published ports bind to loopback only. On a VPS you reach boxes over
+# tailscale, not by exposing SSH to the internet.
+: "${BOXY_BIND_ADDR:=127.0.0.1}"
+
+: "${BOXY_NET:=full}"
+: "${BOXY_PASSWORD_WORDS:=4}"
+: "${BOXY_RESTART:=unless-stopped}"
+: "${BOXY_TS_AUTHKEY:=}"
+: "${BOXY_CPUS:=}"
+: "${BOXY_MEMORY:=}"
+: "${BOXY_SSH_HOST:=127.0.0.1}"
+
+WORDLIST_URL="https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt"
+WORDLIST_COUNT=7776
+
+DEFAULT_ALLOWLIST='# boxy egress allowlist — one domain per line, subdomains included.
+# Used by `boxy create --net limited`. Edit freely.
+
+# Python
+pypi.org
+files.pythonhosted.org
+# conda / conda-forge
+conda.anaconda.org
+repo.anaconda.com
+anaconda.org
+# uv / ruff
+astral.sh
+# git hosting
+github.com
+api.github.com
+codeload.github.com
+raw.githubusercontent.com
+objects.githubusercontent.com
+ghcr.io
+gitlab.com
+# node
+registry.npmjs.org
+# debian
+deb.debian.org
+security.debian.org
+# ML artifacts
+storage.googleapis.com
+huggingface.co
+cdn-lfs.huggingface.co
+cdn-lfs-us-1.hf.co
+# anthropic (claude code inside the box)
+api.anthropic.com
+statsig.anthropic.com
+sentry.io
+'
+
+# ===========================================================================
+# Output helpers
+# ===========================================================================
+if [ -t 2 ]; then
+    C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+    C_DIM=$'\033[2m'; C_BLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_DIM=''; C_BLD=''; C_OFF=''
+fi
+
+info() { printf '%s\n' "$*" >&2; }
+note() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+ok()   { printf '%s%s%s\n' "$C_GRN" "$*" "$C_OFF" >&2; }
+
+# ===========================================================================
+# Small utilities
+# ===========================================================================
+
+load_config() {
+    if [ -f "$BOXY_CONFIG_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$BOXY_CONFIG_FILE"
+    fi
+}
+
+# Defaults that are derived from other settings must be resolved AFTER the
+# config file has been sourced, or a config that moves BOXY_STATE_DIR would
+# still get a key path computed from the built-in one.
+apply_derived_defaults() {
+    # boxy's own keypair lives in boxy's own state dir, not ~/.ssh: boxy
+    # creates and manages it, so it belongs where `rm -rf "$BOXY_STATE_DIR"`
+    # is a complete uninstall. Nothing boxy does touches ~/.ssh unless you
+    # explicitly run `boxy ssh-config --install`. Point this at your own key
+    # in the config file if you would rather supply one.
+    : "${BOXY_SSH_KEY:=$BOXY_STATE_DIR/boxy_ed25519}"
+}
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+    docker info >/dev/null 2>&1 \
+        || die "cannot reach the docker daemon. Is Docker running?"
+}
+
+image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
+
+# Unbiased random integer in [0,N) from /dev/urandom. Rejection sampling
+# rather than a plain modulo, because `rand % 7776` over 16 bits skews the
+# first 1216 words upward — small, but there is no reason to accept it in a
+# password generator.
+rand_below() {
+    local n="$1" limit r
+    limit=$(( 65536 - (65536 % n) ))
+    while :; do
+        r=$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')
+        if [ "$r" -lt "$limit" ]; then
+            printf '%s\n' $(( r % n ))
+            return 0
+        fi
+    done
+}
+
+wordlist_path() { printf '%s\n' "$BOXY_STATE_DIR/eff_large_wordlist.txt"; }
+
+ensure_wordlist() {
+    local wl
+    wl="$(wordlist_path)"
+    if [ -f "$wl" ] && [ "$(wc -l < "$wl" | tr -d ' ')" = "$WORDLIST_COUNT" ]; then
+        return 0
+    fi
+    mkdir -p "$BOXY_STATE_DIR"
+    if curl -fsSL --max-time 20 -o "$wl.tmp" "$WORDLIST_URL" 2>/dev/null \
+        && [ "$(wc -l < "$wl.tmp" | tr -d ' ')" = "$WORDLIST_COUNT" ]; then
+        mv "$wl.tmp" "$wl"
+        note "cached EFF long wordlist ($WORDLIST_COUNT words) at $wl"
+        return 0
+    fi
+    rm -f "$wl.tmp"
+    return 1
+}
+
+# Four words from the EFF long list is ~51.7 bits of entropy. That is the
+# whole point of the 7776-word list: log2(7776) is exactly 12.925 bits per
+# word, and the words are chosen to be unambiguous when typed or dictated.
+gen_password() {
+    local words="$1" wl out i idx word
+    out=""
+    if ensure_wordlist; then
+        wl="$(wordlist_path)"
+        i=0
+        while [ "$i" -lt "$words" ]; do
+            idx=$(( $(rand_below "$WORDLIST_COUNT") + 1 ))
+            # Lines look like "16656  vocation" — take the second field.
+            word="$(sed -n "${idx}p" "$wl" | awk '{print $2}')"
+            [ -n "$word" ] || continue
+            if [ -z "$out" ]; then out="$word"; else out="$out-$word"; fi
+            i=$(( i + 1 ))
+        done
+        printf '%s\n' "$out"
+        return 0
+    fi
+
+    warn "could not fetch the EFF wordlist; falling back to a local dictionary"
+    if [ -r /usr/share/dict/words ]; then
+        local total
+        total="$(wc -l < /usr/share/dict/words | tr -d ' ')"
+        i=0
+        while [ "$i" -lt "$words" ]; do
+            idx=$(( $(rand_below "$total") + 1 ))
+            word="$(sed -n "${idx}p" /usr/share/dict/words \
+                    | tr -cd '[:alpha:]' | tr '[:upper:]' '[:lower:]')"
+            [ -n "$word" ] || continue
+            if [ -z "$out" ]; then out="$word"; else out="$out-$word"; fi
+            i=$(( i + 1 ))
+        done
+        printf '%s\n' "$out"
+        return 0
+    fi
+
+    warn "no dictionary available; using base64 randomness"
+    LC_ALL=C od -An -N24 -tx1 < /dev/urandom | tr -d ' \n'
+    printf '\n'
+}
+
+# Hash the password on the HOST. Only the hash ever crosses into the
+# container, so the plaintext appears in no image layer, no `docker inspect`
+# output, and no /proc/<pid>/environ inside the box.
+hash_password() {
+    local plain="$1"
+    if command -v openssl >/dev/null 2>&1 \
+        && printf 'x' | openssl passwd -6 -stdin >/dev/null 2>&1; then
+        printf '%s' "$plain" | openssl passwd -6 -stdin
+        return 0
+    fi
+    # Fall back to mkpasswd inside the image, fed over stdin so the plaintext
+    # is never a process argument visible in `ps`.
+    if image_exists "$BOXY_IMAGE"; then
+        printf '%s' "$plain" \
+            | docker run --rm -i --network none "$BOXY_IMAGE" \
+                mkpasswd --method=sha512crypt --stdin
+        return 0
+    fi
+    die "no way to hash the password (need openssl with -6, or the $BOXY_IMAGE image)"
+}
+
+# TCP connect probe. A successful connect means something is already there.
+#
+# The connect runs in a subshell so the descriptor is closed for us when that
+# subshell exits. Do NOT "tidy up" with `exec 3>&- 2>/dev/null` here: `exec`
+# with redirections and no command rewires the CURRENT shell permanently, and
+# that stray 2>/dev/null would silently discard every warning the script
+# printed from this point on.
+port_free() {
+    if ( exec 3<>/dev/tcp/127.0.0.1/"$1" ) 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+state_dir_for() { printf '%s\n' "$BOXY_STATE_DIR/instances/$1"; }
+
+# Read a boxy label off a container.
+inst_label() {
+    docker inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null || true
+}
+
+# All boxy-managed container names, oldest first.
+list_instances() {
+    docker ps -a --filter 'label=boxy.managed=1' --format '{{.Names}}' \
+        | sort -t- -k2 -n 2>/dev/null || true
+}
+
+instance_exists() {
+    docker container inspect "$1" >/dev/null 2>&1
+}
+
+require_instance() {
+    local name="$1"
+    [ -n "$name" ] || die "instance name required"
+    instance_exists "$name" || die "no such instance: $name"
+    [ "$(inst_label "$name" boxy.managed)" = "1" ] \
+        || die "container '$name' exists but is not managed by boxy"
+}
+
+# If exactly one instance exists, let the user omit the name.
+resolve_instance() {
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        local all count
+        all="$(list_instances)"
+        count="$(printf '%s\n' "$all" | grep -c . || true)"
+        [ "$count" = "1" ] || die "instance name required (there are $count)"
+        name="$(printf '%s\n' "$all" | head -1)"
+    fi
+    require_instance "$name"
+    printf '%s\n' "$name"
+}
+
+ensure_ssh_key() {
+    local priv="$BOXY_SSH_KEY" pub="$BOXY_SSH_KEY.pub"
+    if [ -f "$pub" ]; then return 0; fi
+    if [ -f "$priv" ]; then
+        ssh-keygen -y -f "$priv" > "$pub" || die "cannot derive public key from $priv"
+        return 0
+    fi
+    info "no boxy keypair at $priv — generating one"
+    mkdir -p "$(dirname "$priv")"
+    chmod 700 "$(dirname "$priv")" 2>/dev/null || true
+    ssh-keygen -q -t ed25519 -N '' -C "boxy@$(hostname -s 2>/dev/null || echo local)" -f "$priv" \
+        || die "ssh-keygen failed"
+    ok "created $priv"
+}
+
+allowlist_file() { printf '%s\n' "$BOXY_CONFIG_DIR/allowlist.txt"; }
+
+ensure_allowlist() {
+    local f
+    f="$(allowlist_file)"
+    if [ ! -f "$f" ]; then
+        mkdir -p "$BOXY_CONFIG_DIR"
+        printf '%s' "$DEFAULT_ALLOWLIST" > "$f"
+        note "wrote default egress allowlist to $f"
+    fi
+}
+
+# ===========================================================================
+# Networks
+# ===========================================================================
+# Restricted boxes get their own ordinary bridge:
+#   boxy-iso-<name>   the box (and, for `limited`, its proxy) live here
+#   boxy-egress       ordinary bridge — only proxies live here
+# The proxy sits on both, which makes it the single, auditable way out.
+#
+# Note what is NOT used: `docker network create --internal`. It does block
+# egress, but it also drops the inbound traffic that published ports depend
+# on, so an isolated box becomes unreachable over SSH — which defeats the
+# entire premise. Isolation is done by route removal instead; see
+# isolate_network().
+
+ensure_network() {
+    local net="$1"
+    docker network inspect "$net" >/dev/null 2>&1 && return 0
+    docker network create "$net" >/dev/null
+}
+
+# Cut a box off from everything except its own subnet.
+#
+# Deleting the default route leaves on-link traffic working — replies to
+# published ports reach the host, and the egress proxy on the same subnet is
+# still reachable — while anything needing a gateway goes nowhere.
+#
+# The crucial detail is WHERE this runs. `docker exec --privileged` grants
+# privileges to the exec'd process alone, so the container itself never holds
+# CAP_NET_ADMIN. The box user has sudo, but `ip route add default` inside the
+# box comes back "Operation not permitted": root in the box cannot undo it.
+isolate_network() {
+    local name="$1" tries=0
+    while [ "$tries" -lt 40 ]; do
+        docker exec --privileged "$name" ip route del default >/dev/null 2>&1 && break
+        docker exec "$name" ip route show default 2>/dev/null | grep -q . || break
+        sleep 0.25
+        tries=$(( tries + 1 ))
+    done
+
+    if docker exec "$name" ip route show default 2>/dev/null | grep -q .; then
+        warn "could not remove the default route from $name — egress is NOT restricted"
+        return 1
+    fi
+
+    # Release the entrypoint, which blocks on this marker before doing
+    # anything network-dependent (notably the repo clone). Without it there is
+    # a window where an isolated box still has a working gateway.
+    docker exec "$name" touch /run/boxy-net-ready >/dev/null 2>&1 || true
+    return 0
+}
+
+remove_network_if_unused() {
+    local net="$1" used
+    docker network inspect "$net" >/dev/null 2>&1 || return 0
+    used="$(docker network inspect -f '{{len .Containers}}' "$net" 2>/dev/null || echo 1)"
+    [ "$used" = "0" ] && docker network rm "$net" >/dev/null 2>&1 || true
+}
+
+# ===========================================================================
+# build
+# ===========================================================================
+cmd_build() {
+    require_docker
+    local nocache="" extras=0 claude=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-cache) nocache="--no-cache" ;;
+            --full)     extras=1; claude=1 ;;
+            --extras)   extras=1 ;;
+            --claude)   claude=1 ;;
+            -h|--help)
+                cat >&2 <<'EOF'
+usage: boxy build [--no-cache] [--full | --extras | --claude]
+
+  (default)   numpy scipy pandas matplotlib-base jax marimo ipython uv
+              conda/mamba node  — the stack you asked for, ~2.7 GB
+  --extras    + jupyterlab polars pyarrow scikit-learn      (+462 MB)
+  --claude    + @anthropic-ai/claude-code inside the box    (+291 MB)
+  --full      both of the above
+
+Anything omitted is still one `uv pip install` away inside a running box.
+EOF
+                return 0 ;;
+            *) die "build: unknown option $1" ;;
+        esac
+        shift
+    done
+
+    info "building $BOXY_IMAGE (extras=$extras claude-code=$claude)"
+    # shellcheck disable=SC2086
+    docker build $nocache \
+        --build-arg "INSTALL_EXTRAS=$extras" \
+        --build-arg "INSTALL_CLAUDE_CODE=$claude" \
+        -t "$BOXY_IMAGE" -f "$SELF_DIR/Dockerfile" "$SELF_DIR"
+
+    info "building $BOXY_PROXY_IMAGE"
+    # shellcheck disable=SC2086
+    docker build $nocache -t "$BOXY_PROXY_IMAGE" -f "$SELF_DIR/docker/Dockerfile.proxy" "$SELF_DIR"
+
+    ok "images ready: $BOXY_IMAGE, $BOXY_PROXY_IMAGE"
+}
+
+# ===========================================================================
+# create
+# ===========================================================================
+usage_create() {
+    cat >&2 <<'EOF'
+usage: boxy create [options]
+
+  -d, --dir DIR         mount DIR at /work (default: fresh scratch dir in $TMPDIR)
+  -r, --repo URL        clone URL into /work on first boot
+  -b, --ref REF         branch/tag to clone (with --repo)
+  -n, --name NAME       instance name (default: boxy-N)
+      --password PASS   sudo password (default: random EFF-wordlist passphrase)
+      --words N         words in the generated passphrase (default: 4)
+  -u, --user NAME       login user inside the box (default: boxyboy)
+  -k, --key PATH        public key to authorize (default: $BOXY_SSH_KEY.pub)
+      --git-key PATH    private key mounted for git (default: ~/.ssh/id_ed25519)
+      --no-git-key      do not mount any git key
+      --net MODE        full | none | limited          (default: full)
+      --allow DOMAIN    extra allowed domain for --net limited (repeatable)
+  -p, --publish SPEC    publish a port, docker-style (repeatable):
+                          -p 2718        -> localhost:2718 -> container 2718
+                          -p 12718:2718  -> localhost:12718 -> container 2718
+                        Default is none; use `boxy forward` instead.
+  -v, --volume SRC:DST  extra bind mount (repeatable)
+  -e, --env K=V         extra environment variable (repeatable)
+      --tailscale       join the tailnet (needs BOXY_TS_AUTHKEY)
+      --ts-hostname H   tailnet hostname (default: instance name)
+      --image IMG       image to run (default: boxy:latest)
+      --cpus N          CPU limit
+      --memory SIZE     memory limit, e.g. 8g
+EOF
+}
+
+cmd_create() {
+    require_docker
+
+    local mount_dir="" repo="" ref="" name="" password="" words="$BOXY_PASSWORD_WORDS"
+    local user="$BOXY_USER" pubkey="" git_key="$BOXY_GIT_KEY" no_git_key=0
+    local net="$BOXY_NET" image="$BOXY_IMAGE"
+    local use_ts=0 ts_host="" cpus="$BOXY_CPUS" memory="$BOXY_MEMORY"
+    local extra_allow=() extra_vols=() extra_envs=() publish=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -d|--dir)       mount_dir="${2:?--dir needs a value}"; shift 2 ;;
+            -r|--repo)      repo="${2:?--repo needs a value}"; shift 2 ;;
+            -b|--ref)       ref="${2:?--ref needs a value}"; shift 2 ;;
+            -n|--name)      name="${2:?--name needs a value}"; shift 2 ;;
+            --password)     password="${2:?--password needs a value}"; shift 2 ;;
+            --words)        words="${2:?--words needs a value}"; shift 2 ;;
+            -u|--user)      user="${2:?--user needs a value}"; shift 2 ;;
+            -k|--key)       pubkey="${2:?--key needs a value}"; shift 2 ;;
+            --git-key)      git_key="${2:?--git-key needs a value}"; shift 2 ;;
+            --no-git-key)   no_git_key=1; shift ;;
+            --net)          net="${2:?--net needs a value}"; shift 2 ;;
+            --allow)        extra_allow[${#extra_allow[@]}]="${2:?--allow needs a value}"; shift 2 ;;
+            -p|--publish)   publish[${#publish[@]}]="${2:?--publish needs a value}"; shift 2 ;;
+            -v|--volume)    extra_vols[${#extra_vols[@]}]="${2:?--volume needs a value}"; shift 2 ;;
+            -e|--env)       extra_envs[${#extra_envs[@]}]="${2:?--env needs a value}"; shift 2 ;;
+            --tailscale)    use_ts=1; shift ;;
+            --ts-hostname)  ts_host="${2:?--ts-hostname needs a value}"; shift 2 ;;
+            --image)        image="${2:?--image needs a value}"; shift 2 ;;
+            --cpus)         cpus="${2:?--cpus needs a value}"; shift 2 ;;
+            --memory)       memory="${2:?--memory needs a value}"; shift 2 ;;
+            -h|--help)      usage_create; return 0 ;;
+            *)              die "create: unknown option $1 (try 'boxy create --help')" ;;
+        esac
+    done
+
+    case "$net" in
+        full|none|limited) ;;
+        *) die "--net must be one of: full, none, limited" ;;
+    esac
+    [ -n "$mount_dir" ] && [ -n "$repo" ] \
+        && die "--dir and --repo are mutually exclusive (mount a dir, or clone into a fresh one)"
+
+    image_exists "$image" || die "image '$image' not found — run: boxy build"
+    if [ "$net" = "limited" ]; then
+        image_exists "$BOXY_PROXY_IMAGE" \
+            || die "proxy image '$BOXY_PROXY_IMAGE' not found — run: boxy build"
+        ensure_allowlist
+    fi
+
+    ensure_ssh_key
+    [ -n "$pubkey" ] || pubkey="$BOXY_SSH_KEY.pub"
+    [ -f "$pubkey" ] || die "public key not found: $pubkey"
+    local authorized_keys
+    authorized_keys="$(cat "$pubkey")"
+
+    # ---- normalise -p specs into host:container pairs --------------------
+    # `-p 2718` means the same number on both sides; `-p 12718:2718` states it
+    # explicitly. Either way the mapping is declared, never inferred from a
+    # port's position in some list.
+    local spec hp cp published_map=""
+    for spec in ${publish[@]+"${publish[@]}"}; do
+        case "$spec" in
+            *:*) hp="${spec%%:*}"; cp="${spec##*:}" ;;
+            *)   hp="$spec";       cp="$spec" ;;
+        esac
+        printf '%s' "$hp$cp" | grep -qE '^[0-9]+$' \
+            || die "--publish: expected PORT or HOSTPORT:PORT, got '$spec'"
+        port_free "$hp" || die "--publish $spec: host port $hp is already in use"
+        published_map="$published_map $hp:$cp"
+    done
+    published_map="${published_map# }"
+
+    # ---- allocate an instance index, and with it the SSH port ------------
+    local used_idx idx=1 ssh_port
+    used_idx="$(for c in $(list_instances); do inst_label "$c" boxy.index; done)"
+    while :; do
+        ssh_port=$(( BOXY_SSH_PORT_BASE + idx - 1 ))
+        if ! printf '%s\n' "$used_idx" | grep -qx "$idx" && port_free "$ssh_port"; then
+            break
+        fi
+        idx=$(( idx + 1 ))
+        [ "$idx" -gt 200 ] && die "could not find a free instance slot below 200"
+    done
+
+    [ -n "$name" ] || name="boxy-$idx"
+    instance_exists "$name" && die "instance '$name' already exists"
+
+    # ---- state -----------------------------------------------------------
+    # Bookkeeping only: host keys, known_hosts, the password file. It exists
+    # for exactly as long as the container does and `boxy rm` deletes it.
+    local sdir
+    sdir="$(state_dir_for "$name")"
+    mkdir -p "$sdir/hostkeys"
+    chmod 700 "$sdir"
+
+    # A -d directory is yours: mounted as-is, never created, never removed.
+    # Otherwise the box gets fresh scratch space in the OS temp area. mktemp
+    # rather than a fixed path per name, so a recreated box never inherits a
+    # previous one's leftovers (which would, among other things, silently skip
+    # a --repo clone because the workdir looked non-empty).
+    local workdir_host
+    if [ -n "$mount_dir" ]; then
+        [ -d "$mount_dir" ] || die "not a directory: $mount_dir"
+        workdir_host="$(cd "$mount_dir" && pwd)"
+    else
+        mkdir -p "$BOXY_WORKDIR_BASE"
+        workdir_host="$(mktemp -d "$BOXY_WORKDIR_BASE/$name.XXXXXX")" \
+            || die "could not create a workdir under $BOXY_WORKDIR_BASE"
+    fi
+
+    # ---- password --------------------------------------------------------
+    local generated=0
+    if [ -z "$password" ]; then
+        password="$(gen_password "$words")"
+        generated=1
+    fi
+    local pw_hash
+    pw_hash="$(hash_password "$password")"
+    [ -n "$pw_hash" ] || die "password hashing produced nothing"
+
+    # Plaintext stays here, host-side, 0600 — never handed to the container.
+    ( umask 077; printf '%s\n' "$password" > "$sdir/password" )
+
+    # ---- networking ------------------------------------------------------
+    local net_name="" proxy_name="" proxy_url="" run_net
+    case "$net" in
+        full)
+            net_name="boxy-net"
+            ensure_network "$net_name"
+            ;;
+        none)
+            net_name="boxy-iso-$name"
+            ensure_network "$net_name"
+            ;;
+        limited)
+            net_name="boxy-iso-$name"
+            ensure_network "$net_name"
+            ensure_network "boxy-egress"
+            proxy_name="boxy-proxy-$name"
+            proxy_url="http://$proxy_name:8888"
+
+            local allowlist
+            allowlist="$(grep -v '^[[:space:]]*#' "$(allowlist_file)" | grep -v '^[[:space:]]*$' || true)"
+            local a
+            for a in ${extra_allow[@]+"${extra_allow[@]}"}; do
+                allowlist="$allowlist
+$a"
+            done
+            [ -n "$allowlist" ] || die "egress allowlist is empty; nothing would be reachable"
+
+            info "starting egress proxy $proxy_name"
+            docker run -d \
+                --name "$proxy_name" \
+                --hostname "$proxy_name" \
+                --restart "$BOXY_RESTART" \
+                --network "boxy-egress" \
+                --label boxy.managed=1 \
+                --label boxy.role=proxy \
+                --label "boxy.instance=$name" \
+                -e "BOXY_ALLOWLIST=$allowlist" \
+                "$BOXY_PROXY_IMAGE" >/dev/null
+            # Second attachment: the proxy is now reachable by name from the
+            # box's internal network while keeping its own route out.
+            docker network connect "$net_name" "$proxy_name"
+            ;;
+    esac
+    run_net="$net_name"
+
+    # ---- assemble docker run --------------------------------------------
+    local args=()
+    args[${#args[@]}]="-d"
+    args[${#args[@]}]="--name";     args[${#args[@]}]="$name"
+    args[${#args[@]}]="--hostname"; args[${#args[@]}]="$name"
+    args[${#args[@]}]="--restart";  args[${#args[@]}]="$BOXY_RESTART"
+    args[${#args[@]}]="--network";  args[${#args[@]}]="$run_net"
+
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.managed=1"
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.role=box"
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.index=$idx"
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.ssh_port=$ssh_port"
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.published=$published_map"
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.workdir=$workdir_host"
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.net=$net"
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.user=$user"
+    args[${#args[@]}]="--label"; args[${#args[@]}]="boxy.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    args[${#args[@]}]="-p"; args[${#args[@]}]="$BOXY_BIND_ADDR:$ssh_port:22"
+    local pair
+    for pair in $published_map; do
+        args[${#args[@]}]="-p"
+        args[${#args[@]}]="$BOXY_BIND_ADDR:${pair%%:*}:${pair##*:}"
+    done
+
+    args[${#args[@]}]="-v"; args[${#args[@]}]="$workdir_host:/work"
+    args[${#args[@]}]="-v"; args[${#args[@]}]="$sdir/hostkeys:/etc/ssh/hostkeys"
+
+    if [ "$no_git_key" = "0" ] && [ -n "$git_key" ] && [ -f "$git_key" ]; then
+        args[${#args[@]}]="-v"; args[${#args[@]}]="$git_key:/run/secrets/git_key:ro"
+    elif [ "$no_git_key" = "0" ] && [ -n "$git_key" ]; then
+        warn "git key $git_key not found — the box will have no git credentials"
+    fi
+
+    local v
+    for v in ${extra_vols[@]+"${extra_vols[@]}"}; do
+        args[${#args[@]}]="-v"; args[${#args[@]}]="$v"
+    done
+
+    args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_NAME=$name"
+    args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_USER=$user"
+    args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_AUTHORIZED_KEYS=$authorized_keys"
+    args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_PASSWORD_HASH=$pw_hash"
+    [ -n "$repo" ] && { args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_REPO=$repo"; }
+    [ -n "$ref" ]  && { args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_REPO_REF=$ref"; }
+    [ -n "$proxy_url" ] && { args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_PROXY_URL=$proxy_url"; }
+    # Tell the entrypoint to block on the isolation marker before it clones.
+    if [ "$net" != "full" ]; then
+        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_AWAIT_NETWORK=1"
+    fi
+
+    # Match the host user's ids so bind-mounted files are not owned by a
+    # stranger — but only on Linux, where a bind mount passes numeric
+    # ownership through untranslated. Docker Desktop's file sharing already
+    # presents mounted files as the container user, so remapping there buys
+    # nothing and costs a multi-minute recursive chown of the conda prefix.
+    if [ "$(uname -s)" = "Linux" ]; then
+        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_UID=$(id -u)"
+        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_GID=$(id -g)"
+    fi
+
+    if [ "$use_ts" = "1" ]; then
+        [ -n "$BOXY_TS_AUTHKEY" ] || die "--tailscale needs BOXY_TS_AUTHKEY (config or environment)"
+        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_TS_AUTHKEY=$BOXY_TS_AUTHKEY"
+        args[${#args[@]}]="-e"; args[${#args[@]}]="BOXY_TS_HOSTNAME=${ts_host:-$name}"
+    fi
+
+    local ev
+    for ev in ${extra_envs[@]+"${extra_envs[@]}"}; do
+        args[${#args[@]}]="-e"; args[${#args[@]}]="$ev"
+    done
+
+    [ -n "$cpus" ]   && { args[${#args[@]}]="--cpus"; args[${#args[@]}]="$cpus"; }
+    [ -n "$memory" ] && { args[${#args[@]}]="--memory"; args[${#args[@]}]="$memory"; }
+
+    if ! docker run "${args[@]}" "$image" >/dev/null; then
+        [ -n "$proxy_name" ] && docker rm -f "$proxy_name" >/dev/null 2>&1
+        [ "$net" != "full" ] && remove_network_if_unused "$net_name"
+        die "docker run failed"
+    fi
+
+    # ---- cut egress before anything in the box can use it ----------------
+    if [ "$net" != "full" ]; then
+        isolate_network "$name" || true
+    fi
+
+    # ---- wait for a real SSH handshake, pinning the host key on the way ---
+    if ! wait_for_ready "$name"; then
+        warn "the box did not become SSH-reachable within the timeout. Recent logs:"
+        docker logs --tail 30 "$name" >&2 || true
+        warn "'boxy exec $name' works without SSH and is the quickest way in."
+    fi
+
+    # ---- report ----------------------------------------------------------
+    printf '\n'
+    ok "created instance $idx ($name), ssh at port $ssh_port"
+    printf '  %sssh%s     ssh -F %s %s        %s(or: boxy ssh %s)%s\n' \
+        "$C_BLD" "$C_OFF" "$(ssh_config_path)" "$name" "$C_DIM" "$name" "$C_OFF"
+    printf '  %sdirect%s  ssh -p %s -i %s %s@%s\n' \
+        "$C_BLD" "$C_OFF" "$ssh_port" "$BOXY_SSH_KEY" "$user" "$BOXY_SSH_HOST"
+    printf '  %sworkdir%s %s -> /work\n' "$C_BLD" "$C_OFF" "$workdir_host"
+    printf '  %snet%s     %s' "$C_BLD" "$C_OFF" "$net"
+    [ -n "$proxy_url" ] && printf ' (proxy %s)' "$proxy_name"
+    printf '\n'
+    if [ "$generated" = "1" ]; then
+        printf '  %ssudo pw%s %s   %s(boxy password %s)%s\n' \
+            "$C_BLD" "$C_OFF" "$password" "$C_DIM" "$name" "$C_OFF"
+    else
+        printf '  %ssudo pw%s (as supplied)   %s(boxy password %s)%s\n' \
+            "$C_BLD" "$C_OFF" "$C_DIM" "$name" "$C_OFF"
+    fi
+    if [ -n "$published_map" ]; then
+        printf '  %sports%s   ' "$C_BLD" "$C_OFF"
+        for pair in $published_map; do
+            printf 'localhost:%s -> %s   ' "${pair%%:*}" "${pair##*:}"
+        done
+        printf '\n'
+    else
+        printf '  %sports%s   none published — %sboxy forward %s%s tunnels %s\n' \
+            "$C_BLD" "$C_OFF" "$C_DIM" "$name" "$C_OFF" "$BOXY_PORTS"
+    fi
+    write_ssh_config >/dev/null
+}
+
+container_running() {
+    [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]
+}
+
+# Wait until the box is genuinely usable, then pin its host key.
+#
+# Note what this deliberately does NOT do: probe the published host port.
+# docker-proxy binds that the instant the container is created, long before
+# sshd exists, so a port probe reports "ready" immediately and hands you a box
+# that refuses every connection. The only honest check is a real handshake.
+wait_for_ready() {
+    local name="$1" sdir cfg tries=0
+    sdir="$(state_dir_for "$name")"
+
+    # Phase 1 — host keys appear on the shared bind mount early in the
+    # entrypoint, and we need them before we can pin anything.
+    while [ "$tries" -lt 90 ]; do
+        [ -f "$sdir/hostkeys/ssh_host_ed25519_key.pub" ] && break
+        container_running "$name" || return 1
+        sleep 1
+        tries=$(( tries + 1 ))
+    done
+    [ -f "$sdir/hostkeys/ssh_host_ed25519_key.pub" ] || return 1
+
+    write_known_hosts "$name"
+    cfg="$(write_ssh_config)"
+
+    # Phase 2 — an actual authenticated connection, which exercises the whole
+    # path at once: port publishing, sshd, host key, and authorized_keys.
+    tries=0
+    while [ "$tries" -lt 90 ]; do
+        if ssh -F "$cfg" -o BatchMode=yes -o ConnectTimeout=5 "$name" true 2>/dev/null; then
+            return 0
+        fi
+        container_running "$name" || return 1
+        sleep 1
+        tries=$(( tries + 1 ))
+    done
+    return 1
+}
+
+# Read the box's public host key straight off the bind-mounted state dir and
+# write a known_hosts entry. No trust-on-first-use prompt, and no blanket
+# StrictHostKeyChecking=no: the host key is verified from the first connection.
+write_known_hosts() {
+    local name="$1" sdir port pubfile
+    sdir="$(state_dir_for "$name")"
+    port="$(inst_label "$name" boxy.ssh_port)"
+    : > "$sdir/known_hosts"
+    for pubfile in "$sdir"/hostkeys/*.pub; do
+        [ -f "$pubfile" ] || continue
+        printf '[%s]:%s %s\n' "$BOXY_SSH_HOST" "$port" "$(cut -d' ' -f1,2 < "$pubfile")" \
+            >> "$sdir/known_hosts"
+    done
+    chmod 600 "$sdir/known_hosts"
+}
+
+# ===========================================================================
+# ssh config
+# ===========================================================================
+ssh_config_path() { printf '%s\n' "$BOXY_STATE_DIR/ssh_config"; }
+
+# Regenerate a standalone ssh_config covering every live box. `ssh -F` this
+# file, or Include it from ~/.ssh/config, and `ssh boxy-1` just works — which
+# is what lets an agent treat a box as an ordinary remote host.
+write_ssh_config() {
+    local out name port user sdir
+    out="$(ssh_config_path)"
+    mkdir -p "$BOXY_STATE_DIR"
+    {
+        printf '# Generated by boxy %s — regenerated on every create/rm.\n' "$BOXY_VERSION"
+        printf '# Do not edit; put overrides in %s.\n\n' "$BOXY_CONFIG_FILE"
+        for name in $(list_instances); do
+            [ "$(inst_label "$name" boxy.role)" = "box" ] || continue
+            port="$(inst_label "$name" boxy.ssh_port)"
+            user="$(inst_label "$name" boxy.user)"
+            sdir="$(state_dir_for "$name")"
+            printf 'Host %s\n' "$name"
+            printf '    HostName %s\n' "$BOXY_SSH_HOST"
+            printf '    Port %s\n' "$port"
+            printf '    User %s\n' "$user"
+            printf '    IdentityFile %s\n' "$BOXY_SSH_KEY"
+            printf '    IdentitiesOnly yes\n'
+            printf '    UserKnownHostsFile %s\n' "$sdir/known_hosts"
+            printf '    StrictHostKeyChecking yes\n'
+            printf '    ForwardAgent no\n'
+            printf '    ServerAliveInterval 30\n\n'
+        done
+    } > "$out"
+    printf '%s\n' "$out"
+}
+
+cmd_ssh_config() {
+    require_docker
+    local install=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --install) install=1; shift ;;
+            -h|--help) printf 'usage: boxy ssh-config [--install]\n'; return 0 ;;
+            *) die "ssh-config: unknown option $1" ;;
+        esac
+    done
+
+    local out
+    out="$(write_ssh_config)"
+    if [ "$install" = "0" ]; then
+        cat "$out"
+        note ""
+        note "wrote $out — use it with: ssh -F $out <name>"
+        note "or run 'boxy ssh-config --install' to Include it from ~/.ssh/config"
+        return 0
+    fi
+
+    local usercfg="$HOME/.ssh/config" line
+    line="Include $out"
+    mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+    touch "$usercfg"; chmod 600 "$usercfg"
+    if grep -qF "$line" "$usercfg"; then
+        ok "~/.ssh/config already includes boxy hosts"
+        return 0
+    fi
+    cp "$usercfg" "$usercfg.boxy-backup.$(date +%s)"
+    # Include must lead the file: ssh takes the first value it obtains for
+    # each keyword, so an Include placed after a `Host *` block would lose.
+    printf '%s\n\n%s' "$line" "$(cat "$usercfg")" > "$usercfg.tmp"
+    mv "$usercfg.tmp" "$usercfg"
+    chmod 600 "$usercfg"
+    ok "added '$line' to the top of ~/.ssh/config (backup alongside it)"
+}
+
+# ===========================================================================
+# ls / info
+# ===========================================================================
+cmd_ls() {
+    require_docker
+    local names
+    names="$(list_instances)"
+    if [ -z "$names" ]; then
+        info "no boxy instances"
+        return 0
+    fi
+    printf '%-12s %-9s %-6s %-8s %s\n' NAME STATUS SSH NET WORKDIR
+    local n status
+    for n in $names; do
+        [ "$(inst_label "$n" boxy.role)" = "box" ] || continue
+        status="$(docker inspect -f '{{.State.Status}}' "$n")"
+        printf '%-12s %-9s %-6s %-8s %s\n' \
+            "$n" "$status" \
+            "$(inst_label "$n" boxy.ssh_port)" \
+            "$(inst_label "$n" boxy.net)" \
+            "$(inst_label "$n" boxy.workdir)"
+    done
+}
+
+cmd_info() {
+    require_docker
+    local name; name="$(resolve_instance "${1:-}")"
+    local sdir; sdir="$(state_dir_for "$name")"
+    local pubmap; pubmap="$(inst_label "$name" boxy.published)"
+    printf 'name        %s\n' "$name"
+    printf 'status      %s\n' "$(docker inspect -f '{{.State.Status}}' "$name")"
+    printf 'created     %s\n' "$(inst_label "$name" boxy.created)"
+    printf 'user        %s\n' "$(inst_label "$name" boxy.user)"
+    printf 'ssh         ssh -F %s %s\n' "$(ssh_config_path)" "$name"
+    printf 'ssh port    %s\n' "$(inst_label "$name" boxy.ssh_port)"
+    printf 'workdir     %s -> /work\n' "$(inst_label "$name" boxy.workdir)"
+    printf 'net         %s\n' "$(inst_label "$name" boxy.net)"
+    printf 'state       %s\n' "$sdir"
+    local pair
+    if [ -n "$pubmap" ]; then
+        printf 'published   '
+        for pair in $pubmap; do
+            printf 'localhost:%s -> %s   ' "${pair%%:*}" "${pair##*:}"
+        done
+        printf '\n'
+    else
+        printf 'published   (none)\n'
+    fi
+    printf 'forwardable %s   %s(boxy forward %s)\n' "$BOXY_PORTS" "$C_DIM$C_OFF" "$name"
+    if [ "$(inst_label "$name" boxy.net)" = "limited" ]; then
+        printf 'proxy       boxy-proxy-%s (docker logs boxy-proxy-%s for denials)\n' "$name" "$name"
+    fi
+}
+
+cmd_password() {
+    local name; name="$(resolve_instance "${1:-}")"
+    local f; f="$(state_dir_for "$name")/password"
+    [ -f "$f" ] || die "no stored password for $name"
+    cat "$f"
+}
+
+# ===========================================================================
+# ssh / exec / forward
+# ===========================================================================
+cmd_ssh() {
+    require_docker
+    # `boxy ssh -- cmd` with a single box: the -- is a separator, not a name.
+    if [ "${1:-}" = "--" ]; then shift; set -- "" "$@"; fi
+    local name; name="$(resolve_instance "${1:-}")"
+    shift || true
+    if [ "${1:-}" = "--" ]; then shift; fi
+    local cfg; cfg="$(write_ssh_config)"
+    exec ssh -F "$cfg" "$name" "$@"
+}
+
+cmd_exec() {
+    require_docker
+    local name; name="$(resolve_instance "${1:-}")"
+    shift || true
+    local user home
+    user="$(inst_label "$name" boxy.user)"
+
+    # `docker exec -u` switches the UID but NOT $HOME — that comes from the
+    # image's ENV, which is root's. A login shell then tries to source
+    # /root/.bash_profile and the box user gets "Permission denied". sshd does
+    # not have this problem (PAM sets HOME from the passwd entry), so it only
+    # ever shows up on this path. Resolve the real home from the container.
+    home="$(docker exec "$name" getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+    [ -n "$home" ] || home="/home/$user"
+
+    if [ $# -eq 0 ]; then
+        exec docker exec -it -u "$user" -e "HOME=$home" -w /work "$name" bash -l
+    fi
+    exec docker exec -i -u "$user" -e "HOME=$home" -w /work "$name" bash -lc "$*"
+}
+
+cmd_forward() {
+    require_docker
+    local name="" bg=0 stop=0 want_ports=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --bg)   bg=1; shift ;;
+            --stop) stop=1; shift ;;
+            -h|--help)
+                printf 'usage: boxy forward [NAME] [--bg|--stop] [PORT ...]\n'
+                printf '  tunnels container ports to the SAME port number on localhost\n'
+                return 0 ;;
+            *)
+                # \+ is a GNU grep extension; -E keeps this working on BSD grep.
+                if [ -z "$name" ] && ! printf '%s' "$1" | grep -qE '^[0-9]+$'; then
+                    name="$1"
+                else
+                    want_ports="$want_ports $1"
+                fi
+                shift ;;
+        esac
+    done
+    name="$(resolve_instance "$name")"
+    local pidfile; pidfile="$(state_dir_for "$name")/forward.pid"
+
+    if [ "$stop" = "1" ]; then
+        [ -f "$pidfile" ] || die "no background tunnel recorded for $name"
+        kill "$(cat "$pidfile")" 2>/dev/null || true
+        rm -f "$pidfile"
+        ok "stopped tunnel for $name"
+        return 0
+    fi
+
+    [ -n "$want_ports" ] || want_ports="$BOXY_PORTS"
+
+    # -L PORT:127.0.0.1:PORT keeps the number identical on both sides, which
+    # is the point: a marimo server on :2718 in the box is on :2718 here.
+    local sshargs=() p
+    for p in $want_ports; do
+        port_free "$p" || { warn "localhost:$p is already in use — skipping"; continue; }
+        sshargs[${#sshargs[@]}]="-L"
+        sshargs[${#sshargs[@]}]="127.0.0.1:$p:127.0.0.1:$p"
+    done
+    [ "${#sshargs[@]}" -gt 0 ] || die "no ports available to forward"
+
+    local cfg; cfg="$(write_ssh_config)"
+    if [ "$bg" = "1" ]; then
+        # Detach stdio. A backgrounded process that keeps the caller's stdout
+        # open leaves any script running `boxy forward --bg` waiting on the
+        # pipe forever — the command "returns" but the shell never does.
+        local fwdlog; fwdlog="$(state_dir_for "$name")/forward.log"
+        ssh -F "$cfg" -N -T -o ExitOnForwardFailure=yes "${sshargs[@]}" "$name" \
+            >"$fwdlog" 2>&1 </dev/null &
+        printf '%s\n' "$!" > "$pidfile"
+        ok "tunnelling$want_ports in the background (boxy forward $name --stop to end)"
+        note "tunnel output: $fwdlog"
+        return 0
+    fi
+    info "tunnelling$want_ports — Ctrl-C to stop"
+    exec ssh -F "$cfg" -N -T -o ExitOnForwardFailure=yes "${sshargs[@]}" "$name"
+}
+
+# ===========================================================================
+# lifecycle
+# ===========================================================================
+cmd_stop() {
+    require_docker
+    local name; name="$(resolve_instance "${1:-}")"
+    docker stop "$name" >/dev/null
+    docker stop "boxy-proxy-$name" >/dev/null 2>&1 || true
+    ok "stopped $name"
+}
+
+cmd_start() {
+    require_docker
+    local name; name="$(resolve_instance "${1:-}")"
+    docker start "boxy-proxy-$name" >/dev/null 2>&1 || true
+    docker start "$name" >/dev/null
+    # A restart restores the default route, so isolation has to be reapplied
+    # every time — not just at create.
+    if [ "$(inst_label "$name" boxy.net)" != "full" ]; then
+        isolate_network "$name" || true
+    fi
+    wait_for_ready "$name" || warn "$name started but is not answering SSH yet"
+    ok "started $name (ssh port $(inst_label "$name" boxy.ssh_port))"
+}
+
+cmd_restart() { cmd_stop "$@"; cmd_start "$@"; }
+
+cmd_logs() {
+    require_docker
+    local name; name="$(resolve_instance "${1:-}")"
+    shift || true
+    exec docker logs "$@" "$name"
+}
+
+# Remove a box. One behaviour, no flags, no confirmation — because nothing it
+# deletes is yours. The container goes, and so does boxy's per-instance
+# bookkeeping (host key, known_hosts, password), which only ever had meaning
+# while the box existed. Your files are never touched: a -d directory is left
+# exactly as it was, and a scratch workdir is left in the OS temp area for the
+# OS to reap on its own schedule.
+cmd_rm() {
+    require_docker
+    local names=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                printf 'usage: boxy rm NAME...\n\n' >&2
+                printf 'Removes the container and boxy'"'"'s bookkeeping for it.\n' >&2
+                printf 'Never touches a -d directory; leaves a scratch workdir\n' >&2
+                printf 'in %s for the OS to clean up.\n' "$BOXY_WORKDIR_BASE" >&2
+                return 0 ;;
+            -f|--force|--purge)
+                # Accepted and ignored: these existed when rm had a destructive
+                # mode. It no longer does.
+                shift ;;
+            *) names[${#names[@]}]="$1"; shift ;;
+        esac
+    done
+    [ "${#names[@]}" -gt 0 ] || die "rm: name required"
+
+    local name sdir workdir net
+    for name in "${names[@]}"; do
+        require_instance "$name"
+        sdir="$(state_dir_for "$name")"
+        workdir="$(inst_label "$name" boxy.workdir)"
+        net="$(inst_label "$name" boxy.net)"
+
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        docker rm -f "boxy-proxy-$name" >/dev/null 2>&1 || true
+        [ "$net" != "full" ] && remove_network_if_unused "boxy-iso-$name"
+        remove_network_if_unused "boxy-egress"
+
+        case "$sdir" in
+            "$BOXY_STATE_DIR"/instances/*) rm -rf "$sdir" ;;
+            *) warn "refusing to remove unexpected state path $sdir" ;;
+        esac
+
+        ok "removed $name"
+        # Tell them where the files are, since that is the only thing that
+        # outlives the box and the only thing worth caring about.
+        case "$workdir" in
+            "$BOXY_WORKDIR_BASE"/*) note "  workdir left for the OS to reap: $workdir" ;;
+            *)                      note "  your directory is untouched: $workdir" ;;
+        esac
+    done
+    write_ssh_config >/dev/null
+}
+
+# ===========================================================================
+# monitoring
+# ===========================================================================
+# `boxy top` is the zero-infrastructure answer: a point-in-time read straight
+# from the daemon, no containers, no retention. It covers "what is running and
+# what is it using right now", which is most of what you want at a keyboard.
+# The Prometheus/Grafana stack below exists for the question this cannot
+# answer — "what happened while I was asleep".
+cmd_top() {
+    require_docker
+    local names watch=0
+    [ "${1:-}" = "--watch" ] || [ "${1:-}" = "-w" ] && watch=1
+    names="$(docker ps --filter 'label=boxy.managed=1' --format '{{.Names}}' | tr '\n' ' ')"
+    if [ -z "$(printf '%s' "$names" | tr -d ' ')" ]; then
+        info "no running boxy instances"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    if [ "$watch" = "1" ]; then
+        exec docker stats $names
+    fi
+    # shellcheck disable=SC2086
+    docker stats --no-stream \
+        --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}' \
+        $names
+}
+
+cmd_monitor() {
+    require_docker
+    local action="${1:-status}"
+    local compose="$SELF_DIR/monitoring/docker-compose.yml"
+    [ -f "$compose" ] || die "monitoring stack not found at $compose"
+    case "$action" in
+        up)
+            docker compose -f "$compose" up -d
+            ok "grafana at http://localhost:3001 (admin / admin on first login)"
+            ok "prometheus at http://localhost:9090"
+            ;;
+        down)   docker compose -f "$compose" down ;;
+        logs)   shift; docker compose -f "$compose" logs "$@" ;;
+        status) docker compose -f "$compose" ps ;;
+        *) die "monitor: expected up | down | status | logs" ;;
+    esac
+}
+
+# ===========================================================================
+# doctor / config
+# ===========================================================================
+cmd_doctor() {
+    local problems=0
+    printf 'boxy %s\n\n' "$BOXY_VERSION"
+
+    if command -v docker >/dev/null 2>&1; then
+        printf '  %-24s %s\n' "docker cli" "$(docker version --format '{{.Client.Version}}' 2>/dev/null || echo '?')"
+        if docker info >/dev/null 2>&1; then
+            printf '  %-24s %s\n' "docker daemon" "reachable"
+        else
+            printf '  %-24s %sNOT REACHABLE%s\n' "docker daemon" "$C_RED" "$C_OFF"; problems=$(( problems + 1 ))
+        fi
+    else
+        printf '  %-24s %sMISSING%s\n' "docker cli" "$C_RED" "$C_OFF"; problems=$(( problems + 1 ))
+    fi
+
+    local img
+    for img in "$BOXY_IMAGE" "$BOXY_PROXY_IMAGE"; do
+        if image_exists "$img"; then
+            printf '  %-24s %s\n' "image $img" "present"
+        else
+            printf '  %-24s %smissing%s (boxy build)\n' "image $img" "$C_YEL" "$C_OFF"
+        fi
+    done
+
+    if [ -f "$BOXY_SSH_KEY.pub" ]; then
+        printf '  %-24s %s\n' "boxy keypair" "$BOXY_SSH_KEY"
+    else
+        printf '  %-24s %snot yet generated%s (created on first boxy create)\n' \
+            "boxy keypair" "$C_YEL" "$C_OFF"
+    fi
+
+    if [ -f "$BOXY_GIT_KEY" ]; then
+        printf '  %-24s %s\n' "git key" "$BOXY_GIT_KEY"
+    else
+        printf '  %-24s %snot found%s — boxes will lack git credentials\n' \
+            "git key" "$C_YEL" "$C_OFF"
+    fi
+
+    if [ -f "$(wordlist_path)" ]; then
+        printf '  %-24s %s words cached\n' "EFF wordlist" "$(wc -l < "$(wordlist_path)" | tr -d ' ')"
+    else
+        printf '  %-24s %snot cached%s (fetched on first create)\n' "EFF wordlist" "$C_YEL" "$C_OFF"
+    fi
+
+    printf '  %-24s %s\n' "config" "$BOXY_CONFIG_FILE"
+    printf '  %-24s %s\n' "state" "$BOXY_STATE_DIR"
+    printf '\n'
+    [ "$problems" -eq 0 ] || die "$problems problem(s) found"
+    ok "looks healthy"
+}
+
+cmd_config() {
+    if [ "${1:-}" = "--init" ]; then
+        mkdir -p "$BOXY_CONFIG_DIR"
+        [ -f "$BOXY_CONFIG_FILE" ] && die "$BOXY_CONFIG_FILE already exists"
+        cp "$SELF_DIR/boxy.conf.example" "$BOXY_CONFIG_FILE"
+        ensure_allowlist
+        ok "wrote $BOXY_CONFIG_FILE"
+        return 0
+    fi
+    printf 'config file  %s%s\n' "$BOXY_CONFIG_FILE" \
+        "$( [ -f "$BOXY_CONFIG_FILE" ] || printf ' (not present; boxy config --init)' )"
+    local k
+    for k in BOXY_STATE_DIR BOXY_WORKDIR_BASE BOXY_IMAGE BOXY_PROXY_IMAGE BOXY_USER BOXY_SSH_KEY \
+             BOXY_GIT_KEY BOXY_SSH_PORT_BASE BOXY_PORTS \
+             BOXY_BIND_ADDR BOXY_NET BOXY_PASSWORD_WORDS BOXY_RESTART \
+             BOXY_SSH_HOST BOXY_CPUS BOXY_MEMORY; do
+        eval "printf '%-20s %s\n' $k \"\$$k\""
+    done
+    printf '%-20s %s\n' BOXY_TS_AUTHKEY \
+        "$( [ -n "$BOXY_TS_AUTHKEY" ] && echo '(set)' || echo '(unset)' )"
+    printf '%-20s %s\n' allowlist "$(allowlist_file)"
+}
+
+# ===========================================================================
+# dispatch
+# ===========================================================================
+usage() {
+    cat >&2 <<EOF
+boxy $BOXY_VERSION — disposable SSH-reachable dev boxes
+
+usage: boxy <command> [options]
+
+CORE — the reason boxy exists
+  create [options]           create and start a box   (boxy create --help)
+  ssh [NAME] [-- CMD]        interactive session, or one command
+  forward [NAME] [PORTS]     tunnel box ports to the SAME localhost ports
+  rm NAME...                 remove a box (never touches your files)
+  ls                         list boxes
+  info [NAME]                one box in detail, including its port map
+  password [NAME]            print the stored sudo password
+  ssh-config [--install]     emit/install an ssh_config covering every box
+  build [--full]             build the images     (boxy build --help)
+  doctor                     check the local setup
+  config [--init]            show or scaffold configuration
+
+DOCKER PASSTHROUGH — thin wrappers that resolve the name and add boxy's
+defaults, then hand off. Equivalent plain-docker command in brackets.
+  exec [NAME] [CMD]          [docker exec]    a way in that does not use ssh
+  logs [NAME] [-f]           [docker logs]    the box's entrypoint narration
+  start|stop|restart [NAME]  [docker start…]  lifecycle
+  top [--watch]              [docker stats]   live CPU/memory per box
+  monitor up|down|status     [docker compose] optional prometheus + grafana
+
+The name may be omitted whenever exactly one box exists.
+EOF
+}
+
+main() {
+    load_config
+    apply_derived_defaults
+    local cmd="${1:-}"
+    [ $# -gt 0 ] && shift || true
+    case "$cmd" in
+        build)       cmd_build "$@" ;;
+        create|new)  cmd_create "$@" ;;
+        ls|list|ps)  cmd_ls "$@" ;;
+        info)        cmd_info "$@" ;;
+        ssh)         cmd_ssh "$@" ;;
+        exec|sh)     cmd_exec "$@" ;;
+        forward|fwd) cmd_forward "$@" ;;
+        password|pw) cmd_password "$@" ;;
+        ssh-config)  cmd_ssh_config "$@" ;;
+        start)       cmd_start "$@" ;;
+        stop)        cmd_stop "$@" ;;
+        restart)     cmd_restart "$@" ;;
+        logs)        cmd_logs "$@" ;;
+        rm|destroy)  cmd_rm "$@" ;;
+        top|stats)   cmd_top "$@" ;;
+        monitor)     cmd_monitor "$@" ;;
+        doctor)      cmd_doctor "$@" ;;
+        config)      cmd_config "$@" ;;
+        -v|--version) printf 'boxy %s\n' "$BOXY_VERSION" ;;
+        ""|-h|--help) usage ;;
+        *)           usage; die "unknown command: $cmd" ;;
+    esac
+}
+
+main "$@"

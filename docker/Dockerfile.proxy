@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.7
+#
+# boxy egress proxy — a tinyproxy sidecar with a domain allowlist.
+#
+# One of these runs per `--net limited` box. It is the only container on both
+# the box's internal network and the outside world, so it is the sole path out.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tinyproxy ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/proxy-entrypoint.sh /usr/local/bin/boxy-proxy-entrypoint
+RUN chmod 755 /usr/local/bin/boxy-proxy-entrypoint
+
+EXPOSE 8888
+ENTRYPOINT ["/usr/local/bin/boxy-proxy-entrypoint"]
