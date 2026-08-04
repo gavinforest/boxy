@@ -17,11 +17,43 @@ PW="$(boxy password nonet)"
 assert_contains "root inside the box cannot restore the route" "not permitted" \
     "$(bssh nonet "echo '$PW' | sudo -S -k ip route add default via 172.30.0.1")"
 
+section "no resolver: the DNS covert channel is closed"
+# Docker's embedded DNS forwards through the daemon, which is OUTSIDE the
+# container's netns — so route removal alone leaves a working resolver, and a
+# box with no route can exfiltrate in query names and receive in TXT records.
+assert_eq "external name resolution is dead" "blocked" \
+    "$(bssh nonet 'timeout 8 getent hosts pypi.org >/dev/null 2>&1 && echo RESOLVED || echo blocked')"
+assert_eq "TXT lookups cannot smuggle data back" "blocked" \
+    "$(bssh nonet 'timeout 8 dig +short +time=2 +tries=1 TXT google.com 2>/dev/null | grep -q . && echo LEAKED || echo blocked')"
+
+section "on-link egress is firewalled"
+# Route removal only stops traffic that needs a gateway; the gateway itself is
+# on-link. A --network host container binds every host-netns interface, which
+# is exactly what a service on a Linux VPS host looks like from inside a box.
+docker rm -f boxy-test-hostsvc >/dev/null 2>&1
+docker run -d --name boxy-test-hostsvc --network host --entrypoint sh boxy:latest \
+    -c 'cd /etc && python -m http.server 39998 --bind 0.0.0.0' >/dev/null 2>&1
+sleep 4
+GW="$(docker exec nonet ip route | awk '/scope link/{print $1}' | cut -d/ -f1 | sed 's/\.0$/.1/')"
+assert_eq "host-netns service is unreachable" "000" \
+    "$(bssh nonet "curl -s -o /dev/null -w '%{http_code}' --max-time 6 http://$GW:39998/")"
+assert_eq "so is a ping to the gateway" "blocked" \
+    "$(bssh nonet "ping -c1 -W2 $GW >/dev/null 2>&1 && echo REACHABLE || echo blocked")"
+assert_contains "the box cannot alter its own firewall" "denied" \
+    "$(bssh nonet "echo '$PW' | sudo -S -k iptables -P OUTPUT ACCEPT")"
+docker rm -f boxy-test-hostsvc >/dev/null 2>&1
+
 section "isolation survives a restart"
+# A restart rebuilds the container's network namespace, so BOTH the route
+# removal and the iptables rules have to be reapplied — they do not persist.
 boxy restart nonet >/dev/null 2>&1
 assert_empty "still no default route" "$(docker exec nonet ip route show default 2>&1)"
 assert_eq "still blocked" "000" \
     "$(bssh nonet 'curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://pypi.org/simple/')"
+assert_contains "firewall rules were reinstalled" "-P OUTPUT DROP" \
+    "$(docker exec --privileged nonet iptables -S OUTPUT 2>&1)"
+assert_eq "resolver is still dead" "blocked" \
+    "$(bssh nonet 'timeout 8 getent hosts pypi.org >/dev/null 2>&1 && echo RESOLVED || echo blocked')"
 
 section "--net limited"
 boxy create -n ltd --net limited --no-git-key >/dev/null 2>&1

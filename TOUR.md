@@ -137,11 +137,12 @@ There is no database. Docker labels are the single source of truth:
 
 ```
 $ docker inspect boxy-1 --format '{{json .Config.Labels}}'
-  boxy.created       2026-08-04T20:41:52Z
+  boxy.caps          minimal
+  boxy.created       2026-08-04T23:32:50Z
   boxy.index         1
   boxy.managed       1
   boxy.net           full
-  boxy.published
+  boxy.published     
   boxy.role          box
   boxy.ssh_port      2200
   boxy.user          boxyboy
@@ -437,10 +438,49 @@ holds `CAP_NET_ADMIN`:
                                             → RTNETLINK answers: Operation not permitted
   no default route after restart   PASS
   still blocked after restart      PASS
+  external name resolution is dead PASS   <- DNS covert channel
+  TXT lookups cannot smuggle data  PASS
+  host-netns service unreachable   PASS   <- on-link gateway
+  box cannot alter its own firewall PASS
 ```
 
-Isolation is reapplied on every `start`/`restart`, since a restart brings the
-route back.
+### Two holes route removal does not close
+
+Both were found by probing rather than reasoning, and both are now shut:
+
+**DNS was a working covert channel.** Docker's embedded resolver forwards
+queries through the daemon, which sits outside the container's network
+namespace — so a `--net none` box with no route anywhere still resolved names,
+and a `dig TXT google.com` returned a real record. Data out in query labels,
+data back in TXT answers. Isolated boxes now get `--dns 127.0.0.1`; container
+names still resolve, which is all a box needs to reach its proxy.
+
+**The gateway stayed reachable.** Route removal only stops traffic that needs
+a gateway; the gateway address is on-link. A service in the host's network
+namespace answered with 200 from inside a "no network" box — on a VPS that is
+sshd, the Docker API, Grafana. An `OUTPUT` firewall now closes it:
+
+```
+$ docker exec --privileged ltd iptables -S OUTPUT
+-P OUTPUT DROP
+-A OUTPUT -o lo -j ACCEPT
+-A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A OUTPUT -d 172.19.0.2/32 -j ACCEPT      # the proxy, --net limited only
+```
+
+The rules are stateful on purpose: inbound SSH arrives by DNAT *from* the
+gateway and replies go back to it, so a blanket drop would cut the connection
+you are sitting on. And they go in by privileged exec, so reading them from
+inside the box fails:
+
+```
+$ sudo iptables -S OUTPUT
+iptables v1.8.9 (nf_tables): Could not fetch rule set generation id:
+Permission denied (you must be root)
+```
+
+Isolation is reapplied on every `start`/`restart`, since a restart rebuilds
+the network namespace and keeps neither the route change nor the firewall.
 
 ### `--net limited`
 
@@ -614,7 +654,70 @@ directory you named, or still sitting in the temp area.
 
 ---
 
-## 11. Test status
+## 11. Container privileges
+
+Boxes run with a reduced capability set by default — 10 of Docker's 14:
+
+```
+$ boxy info boxy-1 | grep caps
+caps        minimal
+
+$ docker exec boxy-1 sh -c 'capsh --decode=$(grep CapBnd /proc/1/status|cut -f2)'
+cap_audit_write cap_chown cap_dac_override cap_fowner cap_kill
+cap_net_bind_service cap_net_raw cap_setgid cap_setuid cap_sys_chroot
+```
+
+Dropped: `MKNOD`, `SETPCAP`, `SETFCAP`, `FSETID`. Nothing in a dev box has a
+plausible use for creating device nodes or editing capability sets.
+
+The set is tuned for **usability over provable minimality**, which is a
+deliberate choice given what these boxes are for. Each retained capability is
+retained because losing it produces a confusing failure rather than an honest
+one. The sharpest example, found by testing rather than reasoning:
+
+```
+$ ping -c1 127.0.0.1
+exec /usr/bin/ping: operation not permitted
+```
+
+`/usr/bin/ping` carries the file capability `cap_net_raw=ep`. The `e`
+(effective) bit means that when `NET_RAW` is outside the bounding set, `exec`
+of the binary fails outright — not a degraded ping, a binary that will not
+start, reporting an error that points nowhere near capabilities. `KILL` is the
+same story (`sudo pkill` silently fails without it), as are
+`NET_BIND_SERVICE` and `AUDIT_WRITE`.
+
+Verified still working under the reduced set: ssh login, sudo to uid 0, ping,
+binding port 80 as an unprivileged user, `pip install`, and `git clone`.
+
+`boxy create --caps default` restores Docker's full 14 — the fastest way to
+rule capabilities in or out when something misbehaves.
+
+### gVisor
+
+```bash
+boxy create --runtime runsc
+```
+
+A user-space kernel: gVisor reimplements the Linux syscall interface in a Go
+process, so a kernel exploit from inside the box hits that reimplementation
+instead of the host kernel.
+
+It earns its keep on a **Linux VPS**, where the container kernel *is* the host
+kernel. On Docker Desktop it is close to pointless, and you can see why:
+
+```
+$ docker run --rm boxy:latest uname -r
+6.12.76-linuxkit          # the VM's kernel — macOS is Darwin 25.5.0
+```
+
+Containers there already run inside a VM, so an escape lands in a disposable
+Linux VM rather than on macOS. gVisor ships with neither Docker nor Docker
+Desktop's VM, so the flag is inert until `runsc` is installed on the host.
+
+---
+
+## 12. Test status
 
 ```bash
 ./test/run.sh              # every suite
@@ -622,27 +725,27 @@ directory you named, or still sitting in the temp area.
 ```
 
 ```
-core:     28 passed, 0 failed
-network:  20 passed, 0 failed
-workflow: 23 passed, 0 failed
+core:     45 passed, 0 failed
+network:  27 passed, 0 failed
+workflow: 28 passed, 0 failed
 
 all suites passed
 ```
 
-71 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
+100 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
 under `$TMPDIR` with their own keypair, so they cannot touch a real install or
 your `~/.ssh` — though they *do* remove every boxy-managed container on the
 host, since a shared Docker daemon is the one resource they cannot sandbox.
 
 | Suite | Covers |
 | --- | --- |
-| `core` | creation, the box interior, the volume, sudo, sshd hardening, host-key pinning |
-| `network` | `--net none` / `--net limited`, restart persistence, allowlist, teardown |
-| `workflow` | ports and `-p`, forwarding, cloning, `ssh_config`, `exec`, the rm/recreate state contract |
+| `core` | creation, the box interior, the volume, sudo, sshd hardening, host-key pinning, capability policy |
+| `network` | `--net none` / `--net limited`, DNS and on-link hardening, restart persistence, allowlist, teardown |
+| `workflow` | ports and `-p`, forwarding, cloning, `ssh_config`, `exec`, the rm/workdir contract |
 
 ---
 
-## 12. Known gaps
+## 13. Known gaps
 
 - **The VPS/tailscale path is wired but untested against real hardware.**
   `--tailscale` runs `tailscaled` in userspace-networking mode (no
@@ -651,8 +754,11 @@ host, since a shared Docker daemon is the one resource they cannot sandbox.
   talks to `docker`. Both need verifying on an actual VPS.
 - **JAX is CPU-only.** GPU needs a CUDA build target and `jax[cuda12]`
   (amd64 only).
-- **`--net limited`/`none` are guardrails, not a sandbox.** They hold against
-  the box user, but not against a container escape, and DNS still resolves
-  through Docker's embedded resolver (no data path, but names leak).
+- **`--net limited`/`none` are guardrails, not a sandbox.** An isolated box
+  cannot reach the internet, the host, or another box. It *can* do whatever it
+  likes with what you handed it: the mounted directory is read-write, a
+  mounted git key is readable, and the allowlist constrains where you can talk
+  rather than what you can say — a POST from a limited box reaches
+  `api.github.com` and gets a real answer.
 - **`BOXY_GIT_KEY` is readable by the box user.** Unavoidable if you want to
   push from inside; use `--no-git-key` or a dedicated deploy key otherwise.

@@ -78,6 +78,51 @@ assert_contains "its keypair lives in the state dir" "$BOXY_STATE_DIR" "$BOXY_SS
 assert_eq "the keypair was created there" "yes" \
     "$( [ -f "$BOXY_SSH_KEY" ] && echo yes || echo no )"
 
+section "capability policy"
+caps_of() { docker exec "$1" sh -c 'capsh --decode=$(grep CapBnd /proc/1/status | cut -f2)' 2>/dev/null \
+    | grep -o 'cap_[a-z_]*' | sort | tr '\n' ' '; }
+MINCAPS="$(caps_of boxy-1)"
+assert_eq "minimal is the default" "minimal" "$(boxy info boxy-1 | awk '/^caps/{print $2}')"
+# The four with no plausible use in a dev box.
+for dropped in cap_mknod cap_setpcap cap_setfcap cap_fsetid; do
+    if printf '%s' "$MINCAPS" | grep -q "$dropped"; then
+        _fail "$dropped is dropped" "still present"
+    else
+        _pass "$dropped is dropped"
+    fi
+done
+# Kept on purpose — each one's absence causes a confusing failure, not an
+# honest one. See the BOXY_MINIMAL_CAPS comment in boxy.
+for kept in cap_net_raw cap_kill cap_net_bind_service cap_audit_write cap_sys_chroot; do
+    assert_contains "$kept is kept" "$kept" "$MINCAPS"
+done
+
+section "minimal caps do not break ordinary use"
+# ping is the sharp one: /usr/bin/ping has cap_net_raw=ep, and a file
+# capability with the effective bit set makes exec() itself fail when the
+# capability is outside the bounding set — so dropping NET_RAW would not
+# degrade ping, it would make the binary unrunnable.
+assert_eq "ping still runs" "works" \
+    "$(bssh boxy-1 'ping -c1 -W2 127.0.0.1 >/dev/null 2>&1 && echo works || echo BROKEN')"
+assert_eq "unprivileged low-port bind still works" "works" \
+    "$(bssh boxy-1 'python -c "import socket;s=socket.socket();s.bind((\"0.0.0.0\",80));print(\"works\")"')"
+assert_contains "sudo still reaches uid 0" "uid=0(root)" \
+    "$(bssh boxy-1 "echo '$PW' | sudo -S -k id")"
+
+section "--caps default is an escape hatch"
+boxy create -n plaincaps --caps default --no-git-key >/dev/null 2>&1
+assert_contains "restores the full docker set" "cap_mknod" "$(caps_of plaincaps)"
+assert_contains "a bad value is rejected" "--caps must be one of" \
+    "$(boxy create -n bogus --caps nonsense --no-git-key 2>&1)"
+# Release the instance slot again so the port assertion below still describes
+# "the second box", not "the fourth".
+boxy rm plaincaps >/dev/null 2>&1
+
+section "container names are validated before any work happens"
+assert_contains "one-character name refused up front" "not a usable container name" \
+    "$(boxy create -n z --no-git-key 2>&1)"
+assert_empty "and nothing was created for it" "$(ls -d "$BOXY_STATE_DIR/instances/z" 2>/dev/null)"
+
 section "second instance"
 boxy create -n api --no-git-key >/dev/null 2>&1
 assert_eq "next ssh port is 2201" "2201" "$(boxy info api | awk '/^ssh port/{print $3}')"

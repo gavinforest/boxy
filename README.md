@@ -118,6 +118,8 @@ The name may be omitted whenever exactly one box exists.
     --git-key PATH    private key mounted for git (default: ~/.ssh/id_ed25519)
     --no-git-key      withhold git credentials
     --net MODE        full | none | limited   (default: full)
+    --caps MODE       minimal | default capability set (default: minimal)
+    --runtime NAME    OCI runtime, e.g. runsc  (default: the daemon's)
     --allow DOMAIN    extra allowed domain for --net limited (repeatable)
 -p, --publish SPEC    publish a port: PORT or HOSTPORT:PORT (repeatable)
 -v, --volume SRC:DST  extra bind mount (repeatable)
@@ -244,8 +246,24 @@ RTNETLINK answers: Operation not permitted
 box's subnet and a normal bridge, making it the single path out. It refuses
 any domain not in `~/.config/boxy/allowlist.txt`.
 
-Isolation is reapplied on every `boxy start`/`restart`, since a restart brings
-the default route back.
+Two things route removal does *not* cover, both closed separately:
+
+**DNS.** Docker's embedded resolver forwards through the daemon, outside the
+container's netns, so an unrouted box could still resolve arbitrary names —
+a covert channel in both directions (data out in query labels, back in TXT
+records). Isolated boxes get `--dns 127.0.0.1`, killing external resolution
+while leaving container-name lookups intact.
+
+**The gateway itself.** It is on-link, so it stays reachable without a default
+route — and on a Linux VPS that is the host, running sshd and whatever else.
+An `OUTPUT` firewall closes it: loopback and `ESTABLISHED,RELATED` are
+allowed (so inbound SSH replies still work), plus the proxy's `/32` under
+`--net limited`. The rules are installed by privileged exec too, so
+`sudo iptables` inside the box fails exactly like `sudo ip route` does.
+
+Isolation is reapplied on every `boxy start`/`restart`, since a restart
+rebuilds the network namespace and keeps neither the route change nor the
+firewall.
 
 The entrypoint exports `HTTP_PROXY`/`HTTPS_PROXY` (into `/etc/environment`, so
 even non-interactive SSH commands see them), points `git`'s HTTP transport at
@@ -371,6 +389,67 @@ tailscale and change the Grafana password (`GF_ADMIN_PASSWORD`).
 
 ---
 
+## Container privileges
+
+Two knobs, both aimed at the VPS rather than your laptop.
+
+### `--caps minimal` (the default)
+
+Drops the four capabilities nothing in a dev box legitimately needs — `MKNOD`,
+`SETPCAP`, `SETFCAP`, `FSETID` — keeping the other ten.
+
+The ones it keeps are kept **deliberately**, because losing them produces
+confusing failures rather than honest ones. The sharpest example:
+
+```
+$ ping -c1 127.0.0.1
+exec /usr/bin/ping: operation not permitted
+```
+
+`/usr/bin/ping` carries the file capability `cap_net_raw=ep`. The `e`
+(effective) bit means that if `NET_RAW` is outside the bounding set, `exec`
+of the binary **fails outright** — you don't get a degraded ping, you get a
+binary that won't start, with an error pointing nowhere near capabilities.
+`KILL` (without it `sudo pkill` fails), `NET_BIND_SERVICE` and `AUDIT_WRITE`
+are kept for the same reason.
+
+If something ever fails in a way that smells like a missing privilege:
+
+```bash
+boxy create --caps default          # Docker's full 14
+```
+
+That's the fastest way to confirm or rule out capabilities as the cause. You
+can also add a single capability via `BOXY_MINIMAL_CAPS` instead of abandoning
+the reduced set.
+
+### `--runtime` (gVisor)
+
+```bash
+boxy create --runtime runsc         # or BOXY_RUNTIME=runsc in the config
+```
+
+gVisor is a user-space kernel: it reimplements the Linux syscall interface in
+a Go process, so a kernel exploit from inside the box hits that
+reimplementation rather than the host kernel. Escaping needs a bug in gVisor
+*and* a second one to clear its own seccomp jail.
+
+Worth it on a **Linux VPS**, where the container kernel is the host kernel.
+Not worth it on **Docker Desktop**, where containers already run inside a VM —
+check for yourself:
+
+```bash
+$ docker run --rm boxy:latest uname -r
+6.12.76-linuxkit          # the VM's kernel, not Darwin
+```
+
+An escape there lands you in a disposable Linux VM, not on macOS. gVisor isn't
+bundled with Docker and isn't present in Docker Desktop's VM, so the setting is
+inert until you install `runsc` on the host and register it in
+`/etc/docker/daemon.json`. Costs 10–50% on syscall- and IO-heavy work.
+
+---
+
 ## Configuration
 
 `~/.config/boxy/config`, sourced as bash. See `boxy.conf.example` for the full
@@ -439,6 +518,58 @@ CPU-only; for GPU you would add a CUDA build target and `jax[cuda12]`.
 - The box user has `sudo` **inside the container**. A container root is not a
   host root, but it is not a hard boundary either — do not run code you
   actively distrust in a box and assume the host is safe.
+- `BOXY_GIT_KEY` is mounted read-only and copied to a `0400` file owned by the
+  box user. The box user can read it — that is unavoidable if you want to push
+  from inside. Use `--no-git-key`, or a dedicated deploy key, when that is not
+  a trade you want.
+- `--net none` and `--net limited` hold up against the box user, on three
+  separate fronts. The default route is removed from outside the container;
+  `CAP_NET_ADMIN` is never granted, so neither `sudo ip route add default` nor
+  `sudo iptables` works from inside; and an `OUTPUT` firewall denies the
+  on-link surface that route removal alone leaves open.
+- **DNS is deliberately dead in an isolated box.** Docker's embedded resolver
+  forwards queries through the daemon, which lives outside the container's
+  network namespace — so removing the route does not touch it, and a box with
+  no route to anywhere could still resolve arbitrary names. That is a
+  bidirectional covert channel: data out in query labels, data back in TXT
+  records. Isolated boxes get `--dns 127.0.0.1`, where nothing listens.
+  Container-name resolution still works, which is all a box needs to find its
+  proxy, and a proxied client hands the hostname to the proxy to resolve.
+- **The gateway is firewalled, not just unrouted.** Deleting the default route
+  only stops traffic that needs a gateway; the gateway address itself is
+  on-link, so an isolated box could otherwise reach anything in the host's
+  network namespace — on a VPS that means sshd, a TCP-exposed Docker API, or
+  Grafana. The rules allow loopback and `ESTABLISHED,RELATED` (so replies to
+  inbound SSH keep flowing) plus, under `--net limited`, the proxy's exact
+  `/32`. Everything else is dropped.
+- Boxes cannot reach each other: each isolated box gets its own subnet with no
+  route between them.
+- **What an isolated box cannot do:** reach the internet, reach the host, or
+  reach another box.
+- **What it can do:** anything it likes with what you handed it. That is not a
+  gap in the implementation, it is the shape of the tool. Concretely:
+  - Your `-d` directory is mounted read-write. Code in the box can read,
+    modify or encrypt it.
+  - `BOXY_GIT_KEY`, unless you pass `--no-git-key`, is readable by the box
+    user — and `github.com` is on the default allowlist. Steal the key, push.
+    No container escape required.
+  - Under `--net limited`, the allowlist constrains *where* you can talk, not
+    *what* you can say. A `POST` from inside a limited box reaches
+    `api.github.com` and gets a real response. Any allowlisted host that
+    accepts uploads is a data path out.
+- **The kernel is shared**, so a kernel privilege-escalation bug escapes
+  everything above at once — namespaces, cgroups, seccomp and capabilities are
+  all enforced by the thing that just got compromised. On Docker Desktop this
+  matters less than it sounds: containers run against the VM's kernel, so an
+  escape lands in a disposable Linux VM, not on macOS. On a Linux VPS the
+  container kernel *is* the host kernel, which is where `BOXY_RUNTIME=runsc`
+  (gVisor) earns its keep.
+- Capabilities are reduced by default (`BOXY_CAPS=minimal`, 10 of Docker's 14)
+  but tuned for usability over provable minimality — see the config file for
+  which are kept and why.
+- All of it is reapplied on every `boxy start`/`restart`, because a restart
+  rebuilds the network namespace and neither the route change nor the firewall
+  survives it.
 - `BOXY_GIT_KEY` is mounted read-only and copied to a `0400` file owned by the
   box user. The box user can read it — that is unavoidable if you want to push
   from inside. Use `--no-git-key`, or a dedicated deploy key, when that is not

@@ -54,6 +54,33 @@ unset _BOXY_TMP
 # tailscale, not by exposing SSH to the internet.
 : "${BOXY_BIND_ADDR:=127.0.0.1}"
 
+# Capability policy: minimal | default.
+#
+# `minimal` drops the four capabilities nothing in a dev box legitimately
+# needs. It deliberately KEEPS the ones whose absence causes confusing
+# failures rather than honest ones:
+#   NET_RAW           /usr/bin/ping carries cap_net_raw=ep, and a file
+#                     capability with the *effective* bit set makes exec()
+#                     itself fail when the capability is outside the bounding
+#                     set. You do not get a degraded ping, you get
+#                     "exec /usr/bin/ping: operation not permitted".
+#   KILL              root cannot signal another user's process without it, so
+#                     `sudo pkill -f marimo` fails.
+#   NET_BIND_SERVICE  redundant while Docker sets ip_unprivileged_port_start=0,
+#                     but a hardened daemon may not, and then low-port binds
+#                     break for no visible reason.
+#   AUDIT_WRITE       PAM writes login records with it.
+# What goes: MKNOD (device nodes), SETPCAP/SETFCAP (capability manipulation),
+# FSETID (setuid-bit preservation). None have a plausible use here.
+: "${BOXY_CAPS:=minimal}"
+: "${BOXY_MINIMAL_CAPS:=CHOWN DAC_OVERRIDE FOWNER KILL SETGID SETUID SYS_CHROOT NET_BIND_SERVICE NET_RAW AUDIT_WRITE}"
+
+# OCI runtime. Empty means the daemon's default (runc). Set to `runsc` on a
+# host where gVisor is installed to put a user-space kernel between the box
+# and the host kernel — worth doing on a Linux VPS, pointless on Docker
+# Desktop where containers already run inside a VM.
+: "${BOXY_RUNTIME:=}"
+
 : "${BOXY_NET:=full}"
 : "${BOXY_PASSWORD_WORDS:=4}"
 : "${BOXY_RESTART:=unless-stopped}"
@@ -401,11 +428,55 @@ isolate_network() {
         return 1
     fi
 
+    firewall_box "$name" || warn "$name: on-link egress is not firewalled (see boxy logs)"
+
     # Release the entrypoint, which blocks on this marker before doing
     # anything network-dependent (notably the repo clone). Without it there is
     # a window where an isolated box still has a working gateway.
     docker exec "$name" touch /run/boxy-net-ready >/dev/null 2>&1 || true
     return 0
+}
+
+# The IP a container holds on one specific network.
+container_ip_on() {
+    docker inspect -f "{{with index .NetworkSettings.Networks \"$2\"}}{{.IPAddress}}{{end}}" \
+        "$1" 2>/dev/null || true
+}
+
+# Close the on-link hole that route removal leaves open.
+#
+# Deleting the default route only stops traffic that NEEDS a gateway. The
+# gateway itself is on-link, so an isolated box could still reach anything in
+# the host's network namespace — on a Linux VPS that is sshd, a TCP-exposed
+# Docker API, Grafana, a database. Verified reachable before this existed.
+#
+# The rules are stateful on purpose. Inbound SSH arrives by DNAT from the
+# gateway and the box's replies go back to that same gateway address, so a
+# blanket "drop everything to the gateway" would cut the connection you are
+# sitting on. Allowing ESTABLISHED,RELATED keeps replies flowing while denying
+# anything the box initiates.
+#
+# Installed via `docker exec --privileged`, so the capability belongs to this
+# one exec'd process and never to the container: `sudo iptables` inside the
+# box fails the same way `sudo ip route add default` does.
+firewall_box() {
+    local name="$1" net proxy_ip="" rules
+    net="$(inst_label "$name" boxy.net)"
+    if [ "$net" = "limited" ]; then
+        proxy_ip="$(container_ip_on "boxy-proxy-$name" "boxy-iso-$name")"
+        [ -n "$proxy_ip" ] || { warn "$name: could not find the proxy's address"; return 1; }
+    fi
+
+    rules='set -e
+iptables -F OUTPUT
+iptables -A OUTPUT -o lo -j ACCEPT
+iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'
+    [ -n "$proxy_ip" ] && rules="$rules
+iptables -A OUTPUT -d $proxy_ip -j ACCEPT"
+    rules="$rules
+iptables -P OUTPUT DROP"
+
+    printf '%s\n' "$rules" | docker exec --privileged -i "$name" sh -s >/dev/null 2>&1
 }
 
 remove_network_if_unused() {
@@ -477,6 +548,8 @@ usage: boxy create [options]
       --git-key PATH    private key mounted for git (default: ~/.ssh/id_ed25519)
       --no-git-key      do not mount any git key
       --net MODE        full | none | limited          (default: full)
+      --caps MODE       minimal | default capability set (default: minimal)
+      --runtime NAME    OCI runtime, e.g. runsc          (default: daemon's)
       --allow DOMAIN    extra allowed domain for --net limited (repeatable)
   -p, --publish SPEC    publish a port, docker-style (repeatable):
                           -p 2718        -> localhost:2718 -> container 2718
@@ -522,6 +595,7 @@ nb_reset() {
     NB_WORDS="$BOXY_PASSWORD_WORDS"; NB_USER="$BOXY_USER"; NB_PUBKEY=""
     NB_GIT_KEY="$BOXY_GIT_KEY"; NB_NO_GIT_KEY=0
     NB_NET="$BOXY_NET"; NB_IMAGE="$BOXY_IMAGE"
+    NB_CAPS="$BOXY_CAPS"; NB_RUNTIME="$BOXY_RUNTIME"
     NB_USE_TS=0; NB_TS_HOST=""; NB_CPUS="$BOXY_CPUS"; NB_MEMORY="$BOXY_MEMORY"
     NB_IDX=""; NB_SSH_PORT=""; NB_PUBLISHED=""
     NB_SDIR=""; NB_WORKDIR=""; NB_AUTHORIZED_KEYS=""
@@ -562,6 +636,8 @@ create_parse_args() {
             --git-key)      NB_GIT_KEY="${2:?--git-key needs a value}";    shift 2 ;;
             --no-git-key)   NB_NO_GIT_KEY=1;                               shift ;;
             --net)          NB_NET="${2:?--net needs a value}";            shift 2 ;;
+            --caps)         NB_CAPS="${2:?--caps needs a value}";          shift 2 ;;
+            --runtime)      NB_RUNTIME="${2:?--runtime needs a value}";    shift 2 ;;
             --allow)        nb_push_allow   "${2:?--allow needs a value}"; shift 2 ;;
             -p|--publish)   nb_push_publish "${2:?--publish needs a value}"; shift 2 ;;
             -v|--volume)    nb_push_vol     "${2:?--volume needs a value}"; shift 2 ;;
@@ -583,6 +659,19 @@ create_validate() {
         full|none|limited) ;;
         *) die "--net must be one of: full, none, limited" ;;
     esac
+    case "$NB_CAPS" in
+        minimal|default) ;;
+        *) die "--caps must be one of: minimal, default" ;;
+    esac
+
+    # Check the name against Docker's own rule here, before create does any
+    # real work. Otherwise a bad name is only caught by `docker run` at the
+    # very end, after a password has been generated and directories and
+    # networks created — and the error names none of that.
+    if [ -n "$NB_NAME" ]; then
+        printf '%s' "$NB_NAME" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$' \
+            || die "--name '$NB_NAME' is not a usable container name: needs 2+ characters, starting with a letter or digit, then letters, digits, '_', '.' or '-'"
+    fi
     if [ -n "$NB_MOUNT_DIR" ] && [ -n "$NB_REPO" ]; then
         die "--dir and --repo are mutually exclusive (mount a dir, or clone into a fresh one)"
     fi
@@ -719,6 +808,7 @@ create_assemble_run_args() {
     arg --label "boxy.published=$NB_PUBLISHED"
     arg --label "boxy.workdir=$NB_WORKDIR"
     arg --label "boxy.net=$NB_NET"
+    arg --label "boxy.caps=$NB_CAPS"
     arg --label "boxy.user=$NB_USER"
     arg --label "boxy.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -751,6 +841,22 @@ create_assemble_run_args() {
     # Tell the entrypoint to block on the isolation marker before it clones.
     [ "$NB_NET" != "full" ] && arg -e "BOXY_AWAIT_NETWORK=1"
 
+    # Deny an isolated box a working resolver.
+    #
+    # Docker's embedded DNS at 127.0.0.11 forwards queries through the daemon,
+    # which lives OUTSIDE the container's network namespace — so removing the
+    # default route does not touch it. A --net none box with no route to
+    # anywhere can still resolve arbitrary names, which is a bidirectional
+    # covert channel: data leaves encoded in query labels and comes back in
+    # TXT records. Verified working before this line existed.
+    #
+    # Pointing the upstream at 127.0.0.1, where nothing listens, kills
+    # external resolution. The embedded server still answers container names
+    # from its own table, which is all the box needs to find its proxy — and
+    # a proxied client sends the hostname to the proxy to resolve, so it never
+    # needed external DNS in the first place.
+    [ "$NB_NET" != "full" ] && arg --dns 127.0.0.1
+
     # Match the host user's ids so bind-mounted files are not owned by a
     # stranger — but only on Linux, where a bind mount passes numeric
     # ownership through untranslated. Docker Desktop's file sharing already
@@ -770,6 +876,17 @@ create_assemble_run_args() {
 
     [ -n "$NB_CPUS" ]   && arg --cpus "$NB_CPUS"
     [ -n "$NB_MEMORY" ] && arg --memory "$NB_MEMORY"
+
+    # Capability policy. `default` leaves Docker's own set alone.
+    if [ "$NB_CAPS" = "minimal" ]; then
+        arg --cap-drop=ALL
+        local cap
+        for cap in $BOXY_MINIMAL_CAPS; do arg --cap-add="$cap"; done
+    fi
+
+    # A non-default OCI runtime (gVisor's runsc, Kata). Left empty, the daemon
+    # picks its own — so this is inert until the host actually has one.
+    [ -n "$NB_RUNTIME" ] && arg --runtime "$NB_RUNTIME"
     return 0
 }
 
@@ -998,6 +1115,7 @@ cmd_info() {
     printf 'ssh port    %s\n' "$(inst_label "$name" boxy.ssh_port)"
     printf 'workdir     %s -> /work\n' "$(inst_label "$name" boxy.workdir)"
     printf 'net         %s\n' "$(inst_label "$name" boxy.net)"
+    printf 'caps        %s\n' "$(inst_label "$name" boxy.caps)"
     printf 'state       %s\n' "$sdir"
     local pair
     if [ -n "$pubmap" ]; then
@@ -1320,7 +1438,7 @@ cmd_config() {
     local k
     for k in BOXY_STATE_DIR BOXY_WORKDIR_BASE BOXY_IMAGE BOXY_PROXY_IMAGE BOXY_USER BOXY_SSH_KEY \
              BOXY_GIT_KEY BOXY_SSH_PORT_BASE BOXY_PORTS \
-             BOXY_BIND_ADDR BOXY_NET BOXY_PASSWORD_WORDS BOXY_RESTART \
+             BOXY_BIND_ADDR BOXY_NET BOXY_CAPS BOXY_RUNTIME BOXY_PASSWORD_WORDS BOXY_RESTART \
              BOXY_SSH_HOST BOXY_CPUS BOXY_MEMORY; do
         eval "printf '%-20s %s\n' $k \"\$$k\""
     done

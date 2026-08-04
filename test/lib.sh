@@ -78,6 +78,7 @@ purge_all() {
     done
     docker network ls --filter 'name=boxy-' -q 2>/dev/null \
         | xargs -r docker network rm >/dev/null 2>&1 || true
+    docker rm -f boxy-test-hostsvc >/dev/null 2>&1 || true
     rm -rf "$BOXY_STATE_DIR/instances"
 }
 

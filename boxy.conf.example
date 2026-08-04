@@ -47,6 +47,50 @@
 # Default egress policy: full | none | limited
 #BOXY_NET=full
 
+# --- container privileges --------------------------------------------------
+
+# Capability policy: minimal | default.
+#
+# `minimal` drops the four Linux capabilities nothing in a dev box legitimately
+# needs — MKNOD (device nodes), SETPCAP and SETFCAP (capability manipulation),
+# FSETID (setuid-bit preservation) — and keeps the other ten.
+#
+# The kept ones are kept deliberately, because their absence produces
+# confusing failures rather than honest ones:
+#
+#   NET_RAW           /usr/bin/ping carries the file capability cap_net_raw=ep.
+#                     A file capability with the *effective* bit set makes
+#                     exec() itself fail when the capability is outside the
+#                     bounding set — so dropping NET_RAW does not degrade ping,
+#                     it makes the binary refuse to start with
+#                     "operation not permitted", which points nowhere useful.
+#   KILL              Without it root cannot signal another user's process, so
+#                     `sudo pkill -f marimo` fails.
+#   NET_BIND_SERVICE  Redundant while Docker sets ip_unprivileged_port_start=0,
+#                     but a hardened daemon may not, and then binding a low
+#                     port breaks for no visible reason.
+#   AUDIT_WRITE       PAM writes login records with it.
+#
+# If something in a box ever fails in a way that smells like a missing
+# privilege, `boxy create --caps default` restores Docker's full set and is the
+# fastest way to confirm or rule it out.
+#BOXY_CAPS=minimal
+
+# The exact set granted under `minimal`. Add to it rather than switching to
+# `default` if you find one specific thing you need.
+#BOXY_MINIMAL_CAPS="CHOWN DAC_OVERRIDE FOWNER KILL SETGID SETUID SYS_CHROOT NET_BIND_SERVICE NET_RAW AUDIT_WRITE"
+
+# OCI runtime. Empty means the daemon's default (runc).
+#
+# Set to `runsc` on a host where gVisor is installed. gVisor is a user-space
+# kernel: it reimplements the Linux syscall interface in a Go process, so a
+# kernel exploit from inside the box hits that reimplementation instead of the
+# host kernel. Worth doing on a Linux VPS, where the container kernel IS the
+# host kernel. Pointless on Docker Desktop, where containers already run inside
+# a VM and an escape lands you in a disposable Linux VM rather than on macOS.
+# Costs: 10-50% on syscall/IO-heavy work, and some syscalls are unimplemented.
+#BOXY_RUNTIME=
+
 # --- passwords ------------------------------------------------------------
 
 # Words drawn from the EFF long (7776-word) list. 4 words is ~51.7 bits.

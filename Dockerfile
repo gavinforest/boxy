@@ -73,6 +73,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
         iproute2 \
+        iptables \
         iputils-ping \
         netcat-openbsd \
         dnsutils \
