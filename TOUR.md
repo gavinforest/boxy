@@ -64,9 +64,9 @@ counted it — so `boxy ssh` on a single limited box refused with
 
 The passthroughs earn their place by resolving the box name and supplying
 defaults you would otherwise have to remember — `boxy exec` sets the box user,
-`$HOME` and `/work`; `boxy start` re-applies egress isolation and re-pins the
-host key. If you would rather not use them, the container name *is* the box
-name, so `docker logs boxy-1` works exactly as you would expect.
+`$HOME` and `/work`; `boxy start` brings the sidecar up alongside the box and
+re-pins the host key. If you would rather not use them, the container name *is*
+the box name, so `docker logs boxy-1` works exactly as you would expect.
 
 `boxy doctor` says whether the machine is ready. It is deliberately relaxed
 about things created lazily:

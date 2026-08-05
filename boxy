@@ -76,13 +76,17 @@ unset _BOXY_TMP
 
 # Boxes do not come back on their own.
 #
-# This is a correctness setting, not a convenience one. Egress isolation is
-# applied from OUTSIDE the container — boxy deletes the default route and
-# installs firewall rules after `docker run`. A restart rebuilds the network
-# namespace and both are lost, and the Docker daemon restarting a box at
-# startup does not go through boxy, so nothing puts them back: a `--net none`
-# box would return fully connected while still labelled isolated.
-# `boxy start` re-applies everything, so starting a box deliberately is safe.
+# This used to be load-bearing: isolation was applied from outside the
+# container after `docker run`, so a daemon-driven restart — which does not go
+# through boxy — brought a `--net none` box back fully connected while it was
+# still labelled isolated. It is not load-bearing any more. A box sits alone on
+# an `internal` network, and that is a property of the network definition
+# rather than of the running container, so there is nothing a restart can
+# undo and nothing for boxy to reapply.
+#
+# What is left is a lifecycle preference, and `no` is still the right one: a
+# box is scratch space you are expected to `boxy rm`, and one you forgot about
+# should stay gone after a reboot rather than quietly reclaiming its SSH port.
 : "${BOXY_RESTART:=no}"
 
 : "${BOXY_CPUS:=}"
@@ -1681,16 +1685,16 @@ CORE — boxy functionality
   create [options]           create and start a box   (boxy create --help)
   ssh [NAME] [-- CMD]        interactive session, or one command
   forward [NAME] [PORTS]     tunnel box ports to the SAME localhost ports
-  rm NAME...                 remove a box (never touches your files)
+  rm NAME...                 remove a box (doesn't touch your files)
   ls                         list boxes
-  info [NAME]                one box in detail, checked against reality
+  info [NAME]                one box in detail, checks config and reality
   password [NAME]            print the stored sudo password
   ssh-config [--install]     emit/install an ssh_config covering every box
   build [--full]             build the images     (boxy build --help)
   doctor [--verbose]         check the local setup; -v adds info per box
   config [--init]            show or scaffold configuration
 
-DOCKER PASSTHROUGH — wrappers that resolve the container name, add boxy's
+DOCKER PASSTHROUGH — wrappers that resolve container name, add boxy's
 defaults, then hand off. [Equivalent docker command in brackets].
   exec [NAME] [CMD]          [docker exec]    a way in that does not use ssh
   logs [NAME] [-f]           [docker logs]    the box's entrypoint narration

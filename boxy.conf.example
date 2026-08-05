@@ -80,12 +80,12 @@
 
 # Whether a box comes back on its own after the Docker daemon restarts.
 #
-# Leave this alone unless you know you want it. Egress isolation is applied
-# from outside the container and does not survive a restart, and a daemon-
-# driven restart does not go through boxy — so a `--net none` box set to
-# `unless-stopped` returns fully connected while still labelled isolated.
-# `boxy start` re-applies isolation, so starting a box yourself is safe, and
-# `boxy doctor` reports any box that has drifted.
+# `unless-stopped` is safe here — an isolated box stays isolated across a
+# restart, because it is alone on a Docker `internal` network and that holds
+# whether or not boxy is in the loop. The default is `no` for a lifecycle
+# reason instead: a box is scratch space you are expected to `boxy rm`, and one
+# you forgot about should stay gone after a reboot rather than coming back and
+# holding its SSH port.
 #BOXY_RESTART=no
 
 #BOXY_CPUS=

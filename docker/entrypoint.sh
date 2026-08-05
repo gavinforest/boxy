@@ -188,22 +188,6 @@ chmod 600 "$SSH_CONF"
 # ---------------------------------------------------------------------------
 # 7. Workdir
 # ---------------------------------------------------------------------------
-# For an isolated box, boxy removes the default route from the host side just
-# after `docker run` and then drops this marker. Blocking on it closes the
-# window in which a --net none box would still have had a working gateway
-# while this script was setting things up.
-if [[ "${BOXY_AWAIT_NETWORK:-0}" == "1" ]]; then
-    for _ in $(seq 1 120); do
-        [[ -f /run/boxy-net-ready ]] && break
-        sleep 0.25
-    done
-    if [[ -f /run/boxy-net-ready ]]; then
-        log "network isolation confirmed by host"
-    else
-        log "WARNING: isolation marker never arrived; continuing anyway"
-    fi
-fi
-
 install -d -o "$CUR_UID" -g "$CUR_GID" "$BOXY_WORKDIR"
 # Chown only when ownership actually differs; a large mounted tree is slow.
 if [[ "$(stat -c %u "$BOXY_WORKDIR")" != "$CUR_UID" ]]; then
