@@ -129,12 +129,40 @@ write `./worktree`.
     --caps MODE       minimal | default capability set (default: minimal)
     --allow DOMAIN    extra allowed domain for --net limited (repeatable)
 -p, --publish SPEC    publish a port: PORT or HOSTPORT:PORT (repeatable)
--v, --volume SRC:DST  extra bind mount (repeatable)
--e, --env K=V         extra environment variable (repeatable)
     --image IMG       image to run
     --cpus N          CPU limit
     --memory SIZE     memory limit, e.g. 8g
 ```
+
+### Anything else docker can do
+
+Everything after `--` is handed to `docker run` unchanged:
+
+```bash
+boxy create . -- -v ~/data:/data --gpus all --shm-size 2g
+```
+
+This is why the option list above is short. boxy carries a flag only where it
+adds something of its own — `--publish` binds through the sidecar, `--net`
+selects an isolation mode — and leaves the rest to docker rather than growing a
+wrapper per feature. `-v` and `-e` used to be such wrappers; `--` replaced them.
+
+Passthrough flags are appended last, so where docker takes the final value of a
+repeated flag, yours beats boxy's (`--cpus 1 -- --cpus 3` gives you 3). Flags
+docker accumulates instead — `-v`, `-e`, `--cap-add` — add to what boxy set.
+
+Two things to know:
+
+- **`--network` is refused.** boxy owns the network: `--net` picks it, the
+  sidecar attaches to it, `boxy rm` tears it down, and `boxy info` reports
+  isolation by reading it. Setting it behind boxy's back would leave all four
+  describing a container that no longer exists.
+- **`-e` does not reach `boxy ssh`.** The variable is set on the container, so
+  the box's own processes and `boxy exec` see it, but an ssh session builds a
+  fresh environment through PAM and does not inherit PID 1's. This is not new —
+  the old `--env` flag had exactly the same limitation, since it produced the
+  same `docker run -e`. For a value you need in ssh sessions, write it into
+  `~/.profile` in the box.
 
 ---
 

@@ -118,6 +118,42 @@ assert_contains "a bad value is rejected" "--caps must be one of" \
 # "the second box", not "the fourth".
 boxy rm plaincaps >/dev/null 2>&1
 
+section "-- hands the rest to docker run"
+# The escape hatch that lets `-v` and `-e` stay off the option list. If this
+# stops working, every docker feature boxy does not wrap becomes unreachable.
+PTDATA="$TEST_TMP/ptdata"
+rm -rf "$PTDATA"; mkdir -p "$PTDATA"; echo "passed-through" > "$PTDATA/hello.txt"
+boxy create "$WORK" -n pt --cpus 1 -- -v "$PTDATA:/data" --shm-size 256m --cpus 3 >/dev/null 2>&1
+assert_eq "a passthrough mount lands in the box" "passed-through" \
+    "$(bssh pt cat /data/hello.txt)"
+assert_eq "a passthrough flag boxy has no wrapper for is applied" "268435456" \
+    "$(docker inspect pt --format '{{.HostConfig.ShmSize}}')"
+# Appended last on purpose: for a flag docker resolves last-wins, the user's
+# value has to beat boxy's or the hatch is a suggestion rather than an override.
+assert_eq "and beats boxy's own value for the same flag" "3000000000" \
+    "$(docker inspect pt --format '{{.HostConfig.NanoCpus}}')"
+assert_eq "boxy's own mount still works alongside it" "from the host" \
+    "$(bssh pt cat /work/notes.md)"
+boxy rm pt >/dev/null 2>&1
+
+section "the network is not passthrough-able"
+# boxy's --net picks the network, the sidecar attaches to it, and `boxy info`
+# reports isolation by reading it. Letting --network through would leave the
+# label describing a container that no longer exists.
+assert_contains "--network is refused" "network is boxy's to set" \
+    "$(boxy create -n ptnet -- --network host 2>&1)"
+assert_contains "and so is the --net=host spelling" "network is boxy's to set" \
+    "$(boxy create -n ptnet -- --net=host 2>&1)"
+assert_empty "nothing was created for either" \
+    "$(ls -d "$BOXY_STATE_DIR/instances/ptnet" 2>/dev/null)"
+# A passthrough must not be able to quietly un-isolate a sealed box.
+boxy create -n ptiso --net none -- --shm-size 128m >/dev/null 2>&1
+assert_eq "an isolated box stays on its internal network" "true" \
+    "$(docker network inspect boxy-iso-ptiso --format '{{.Internal}}')"
+assert_contains "and info still reports it honestly" "enforced by docker" \
+    "$(boxy info ptiso)"
+boxy rm ptiso >/dev/null 2>&1
+
 section "container names are validated before any work happens"
 assert_contains "one-character name refused up front" "not a usable container name" \
     "$(boxy create -n z 2>&1)"

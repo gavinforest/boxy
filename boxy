@@ -542,11 +542,22 @@ options:
                           -p 2718        -> localhost:2718 -> container 2718
                           -p 12718:2718  -> localhost:12718 -> container 2718
                         Default is none; use `boxy forward` instead.
-  -v, --volume SRC:DST  extra bind mount (repeatable)
-  -e, --env K=V         extra environment variable (repeatable)
       --image IMG       image to run (default: boxy:latest)
       --cpus N          CPU limit
       --memory SIZE     memory limit, e.g. 8g
+
+Anything after `--` is passed to `docker run` unchanged, so boxy needs no
+wrapper flag of its own for each docker feature:
+
+  boxy create . -- -v ~/data:/data
+  boxy create . -- --gpus all --shm-size 2g
+
+These land after boxy's own flags, so where docker takes the last value of a
+repeated flag, yours wins. Two caveats:
+
+  --network   boxy's to set; use --net full|none|limited instead
+  -e K=V      reaches the box's processes and `boxy exec`, but NOT `boxy ssh`
+              sessions, which get a fresh environment from PAM
 EOF
 }
 
@@ -586,7 +597,7 @@ nb_reset() {
     NB_IDX=""; NB_SSH_PORT=""; NB_PUBLISHED=""
     NB_SDIR=""; NB_WORKDIR=""; NB_AUTHORIZED_KEYS=""
     NB_NET_NAME=""; NB_SIDECAR_NAME=""; NB_PROXY_URL=""
-    NB_ALLOW=(); NB_VOLS=(); NB_ENVS=(); NB_PUBLISH=()
+    NB_ALLOW=(); NB_PUBLISH=(); NB_DOCKER=()
     RUN_ARGS=()
 }
 
@@ -599,8 +610,6 @@ arg() { while [ $# -gt 0 ]; do RUN_ARGS[${#RUN_ARGS[@]}]="$1"; shift; done; }
 
 # Append to an NB_ list. Same reason.
 nb_push_allow()   { NB_ALLOW[${#NB_ALLOW[@]}]="$1"; }
-nb_push_vol()     { NB_VOLS[${#NB_VOLS[@]}]="$1"; }
-nb_push_env()     { NB_ENVS[${#NB_ENVS[@]}]="$1"; }
 nb_push_publish() { NB_PUBLISH[${#NB_PUBLISH[@]}]="$1"; }
 
 # ---------------------------------------------------------------------------
@@ -620,12 +629,22 @@ create_parse_args() {
             --caps)         NB_CAPS="${2:?--caps needs a value}";          shift 2 ;;
             --allow)        nb_push_allow   "${2:?--allow needs a value}"; shift 2 ;;
             -p|--publish)   nb_push_publish "${2:?--publish needs a value}"; shift 2 ;;
-            -v|--volume)    nb_push_vol     "${2:?--volume needs a value}"; shift 2 ;;
-            -e|--env)       nb_push_env     "${2:?--env needs a value}";   shift 2 ;;
             --image)        NB_IMAGE="${2:?--image needs a value}";        shift 2 ;;
             --cpus)         NB_CPUS="${2:?--cpus needs a value}";          shift 2 ;;
             --memory)       NB_MEMORY="${2:?--memory needs a value}";      shift 2 ;;
             -h|--help)      usage_create; return 1 ;;
+            # Everything after `--` reaches `docker run` untouched. This is
+            # what lets the option list stay short: boxy does not need a
+            # wrapper flag for each docker feature, because the feature itself
+            # is still one `--` away. `-v` and `-e` were exactly that kind of
+            # wrapper and are gone; `boxy create . -- -v ~/data:/data` is the
+            # replacement, and it also covers --gpus, --shm-size and the rest
+            # of docker without boxy having to grow a line per flag.
+            --)
+                shift
+                while [ $# -gt 0 ]; do
+                    NB_DOCKER[${#NB_DOCKER[@]}]="$1"; shift
+                done ;;
             -*)             die "create: unknown option $1 (try 'boxy create --help')" ;;
             # The one positional: what goes in /work. Accepted before or after
             # the flags, so both `boxy create . -n web` and `boxy create -n web .`
@@ -648,6 +667,21 @@ create_validate() {
         minimal|default) ;;
         *) die "--caps must be one of: minimal, default" ;;
     esac
+
+    # The passthrough is deliberately unpoliced except here. The network is the
+    # one thing boxy cannot let you set behind its back: `--net` picks it, the
+    # sidecar attaches to it, `boxy rm` tears it down, and `boxy info` reports
+    # isolation by reading it. A passthrough --network would leave all four
+    # describing a box that no longer exists — the label would say `none` over
+    # a fully connected container, which is precisely the failure the internal-
+    # network design was built to make impossible.
+    local d
+    for d in ${NB_DOCKER[@]+"${NB_DOCKER[@]}"}; do
+        case "$d" in
+            --network|--network=*|--net|--net=*)
+                die "create: the network is boxy's to set — use 'boxy create --net full|none|limited' rather than passing $d through" ;;
+        esac
+    done
 
     # Check the name against Docker's own rule here, before create does any
     # real work. Otherwise a bad name is only caught by `docker run` at the
@@ -950,9 +984,6 @@ create_assemble_run_args() {
         arg -e "BOXY_GIT_COMMON_DIR=$NB_WT_GITDIR"
     fi
 
-    local v
-    for v in ${NB_VOLS[@]+"${NB_VOLS[@]}"}; do arg -v "$v"; done
-
     arg -e "BOXY_NAME=$NB_NAME"
     arg -e "BOXY_USER=$NB_USER"
     arg -e "BOXY_AUTHORIZED_KEYS=$NB_AUTHORIZED_KEYS"
@@ -969,9 +1000,6 @@ create_assemble_run_args() {
         arg -e "BOXY_UID=$(id -u)" -e "BOXY_GID=$(id -g)"
     fi
 
-    local ev
-    for ev in ${NB_ENVS[@]+"${NB_ENVS[@]}"}; do arg -e "$ev"; done
-
     [ -n "$NB_CPUS" ]   && arg --cpus "$NB_CPUS"
     [ -n "$NB_MEMORY" ] && arg --memory "$NB_MEMORY"
 
@@ -981,6 +1009,13 @@ create_assemble_run_args() {
         local cap
         for cap in $BOXY_MINIMAL_CAPS; do arg --cap-add="$cap"; done
     fi
+
+    # Passthrough goes last, so that where docker takes the final value of a
+    # repeated flag, yours is the final one. That is the difference between an
+    # escape hatch and a second opinion: `-- --cpus 4` has to beat boxy's
+    # --cpus, not lose to it. Flags docker accumulates rather than overwrites
+    # (-v, -e, --cap-add) simply add to what boxy already set.
+    arg ${NB_DOCKER[@]+"${NB_DOCKER[@]}"}
 
     return 0
 }
@@ -1699,10 +1734,10 @@ CORE
   config [--init]            show or scaffold configuration
 
 DOCKER PASSTHROUGH — resolve the box name, then hand off to docker
-  exec [NAME] [CMD]          in as the box user, at /work
+  exec [NAME] [CMD]          adds defaults: as box user, at /work
   logs [NAME] [-f]           the box's entrypoint narration
-  start|stop|restart [NAME]  lifecycle; the sidecar follows the box
-  top [--watch]              boxes and sidecars  [docker stats]
+  start|stop|restart [NAME]  lifecycle + ensures sidecar follows box
+  top [--watch]              [docker stats] for boxes and sidecars
 
 The name may be omitted whenever exactly one box exists.
 Full options: boxy create --help, boxy build --help
