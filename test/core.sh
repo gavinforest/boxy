@@ -10,7 +10,7 @@ rm -rf "$WORK"; mkdir -p "$WORK/src"
 echo "from the host" > "$WORK/notes.md"
 
 section "create"
-out="$(boxy create -d "$WORK" --no-git-key 2>&1)"
+out="$(boxy create "$WORK" 2>&1)"
 assert_contains "reports the instance and its ssh port" "ssh at port 2200" "$out"
 assert_contains "says no ports are published by default" "none published" "$out"
 
@@ -110,21 +110,21 @@ assert_contains "sudo still reaches uid 0" "uid=0(root)" \
     "$(bssh boxy-1 "echo '$PW' | sudo -S -k id")"
 
 section "--caps default is an escape hatch"
-boxy create -n plaincaps --caps default --no-git-key >/dev/null 2>&1
+boxy create -n plaincaps --caps default >/dev/null 2>&1
 assert_contains "restores the full docker set" "cap_mknod" "$(caps_of plaincaps)"
 assert_contains "a bad value is rejected" "--caps must be one of" \
-    "$(boxy create -n bogus --caps nonsense --no-git-key 2>&1)"
+    "$(boxy create -n bogus --caps nonsense 2>&1)"
 # Release the instance slot again so the port assertion below still describes
 # "the second box", not "the fourth".
 boxy rm plaincaps >/dev/null 2>&1
 
 section "container names are validated before any work happens"
 assert_contains "one-character name refused up front" "not a usable container name" \
-    "$(boxy create -n z --no-git-key 2>&1)"
+    "$(boxy create -n z 2>&1)"
 assert_empty "and nothing was created for it" "$(ls -d "$BOXY_STATE_DIR/instances/z" 2>/dev/null)"
 
 section "second instance"
-boxy create -n api --no-git-key >/dev/null 2>&1
+boxy create -n api >/dev/null 2>&1
 assert_eq "next ssh port is 2201" "2201" "$(boxy info api | awk '/^ssh port/{print $3}')"
 assert_contains "ls shows both" "api" "$(boxy ls)"
 

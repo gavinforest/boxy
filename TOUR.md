@@ -18,7 +18,7 @@ stack preinstalled, they mount a directory of yours at `/work`, they expose
 services either through an SSH tunnel that keeps the port number identical or
 through an explicit docker-style `-p`, and their internet access can be
 switched off or narrowed to an allowlist. Nothing secret is baked into the
-image — keys, password hashes, repo URLs and proxy settings all arrive at
+image — keys, password hashes and proxy settings all arrive at
 `docker run` time.
 
 ---
@@ -53,7 +53,6 @@ defaults, then hand off. Equivalent plain-docker command in brackets.
   logs [NAME] [-f]           [docker logs]    the box's entrypoint narration
   start|stop|restart [NAME]  [docker start…]  lifecycle
   top [--watch]              [docker stats]   live CPU/memory per box
-  monitor up|down|status     [docker compose] optional prometheus + grafana
 
 The name may be omitted whenever exactly one box exists.
 ```
@@ -81,7 +80,6 @@ boxy 1.0.0
   image boxy:latest        present
   image boxy-proxy:latest  present
   boxy keypair             not yet generated (created on first boxy create)
-  git key                  ~/.ssh/id_ed25519
   EFF wordlist             not cached (fetched on first create)
   config                   ~/.config/boxy/config
   state                    ~/.local/share/boxy
@@ -94,7 +92,7 @@ looks healthy
 ## 2. Creating a box
 
 ```
-$ boxy create -d ~/code/demo
+$ cd ~/code/demo && boxy create .
 
 no boxy keypair at ~/.local/share/boxy/boxy_ed25519 — generating one
 created ~/.local/share/boxy/boxy_ed25519
@@ -127,8 +125,8 @@ wordlist. Subsequent creates take ~3s.
 
 That `instances/boxy-1/` directory is bookkeeping with the same lifetime as
 the container — `boxy rm` deletes it. Your actual files are elsewhere: either
-the directory you passed to `-d`, or a fresh scratch dir under
-`$TMPDIR/boxy/` when you didn't.
+the directory you named, the worktree boxy created, or a fresh scratch dir
+under `$TMPDIR/boxy/` when you named nothing.
 
 Note where the keypair is: **boxy's own state directory, not `~/.ssh`**. boxy
 creates and manages this key, so it belongs with boxy's other state, where
@@ -273,7 +271,7 @@ $ boxy ssh boxy-1 -- 'python -c "print(2**16)"'
 ```
 
 Both forms land in `/work`. Note that `/work` is a **directory** — the mount
-point for whatever you passed to `-d` (or the cloned repo):
+point for whatever you named, be it a directory or a worktree:
 
 ```
 (base) boxyboy@boxy-1:/work$ stat -c %F /work
@@ -417,75 +415,87 @@ boxy create --net none      # no route off the host
 boxy create --net limited   # allowlisting proxy only
 ```
 
-### How, and why not the obvious way
+### How: Docker enforces it, boxy does not
 
-The obvious implementation is `docker network create --internal`. I built it
-that way first and it fails: an internal network blocks egress *and* the
-inbound traffic published ports depend on, so `--net none` boxes became
-unreachable over SSH — which defeats the entire premise. The readiness check
-caught it rather than reporting a healthy box.
+An isolated box sits **alone on a `docker network create --internal` network**.
+Docker installs no default route for it, no NAT rule for its subnet, and no
+external DNS. That is the entire mechanism.
 
-What works instead is an ordinary bridge with the **default route deleted**.
-On-link traffic still flows — replies to published ports reach the host, and a
-proxy sidecar on the same subnet stays reachable — while anything needing a
-gateway goes nowhere.
-
-The route is removed from the *host* via `docker exec --privileged`, which
-grants privileges to that single exec'd process. The container itself never
-holds `CAP_NET_ADMIN`:
+The property that matters is where the isolation *lives*. It is part of the
+network's definition, not state applied to a running container, so nothing has
+to be reapplied and nothing can be lost:
 
 ```
-  ssh works on an isolated box     PASS
-  no default route                 PASS
-  https blocked                    PASS
-  raw IP blocked                   PASS
-  box root CANNOT restore the route PASS   ← sudo ip route add default
-                                            → RTNETLINK answers: Operation not permitted
-  no default route after restart   PASS
-  still blocked after restart      PASS
-  external name resolution is dead PASS   <- DNS covert channel
-  TXT lookups cannot smuggle data  PASS
-  host-netns service unreachable   PASS   <- on-link gateway
-  box cannot alter its own firewall PASS
+  ssh works on an isolated box       PASS
+  no default route                   PASS
+  https blocked                      PASS
+  raw IP blocked                     PASS
+  the box's network is internal      PASS
+  the box binds no host ports        PASS
+  external name resolution is dead   PASS   <- DNS covert channel, closed for free
+  TXT lookups cannot smuggle data    PASS
+  still isolated after a raw restart PASS   <- see below
+  box root cannot undo it            PASS   -> RTNETLINK: Operation not permitted
 ```
 
-### Two holes route removal does not close
+### What this replaced, and why
 
-Both were found by probing rather than reasoning, and both are now shut:
-
-**DNS was a working covert channel.** Docker's embedded resolver forwards
-queries through the daemon, which sits outside the container's network
-namespace — so a `--net none` box with no route anywhere still resolved names,
-and a `dig TXT google.com` returned a real record. Data out in query labels,
-data back in TXT answers. Isolated boxes now get `--dns 127.0.0.1`; container
-names still resolve, which is all a box needs to reach its proxy.
-
-**The gateway stayed reachable.** Route removal only stops traffic that needs
-a gateway; the gateway address is on-link. A service in the host's network
-namespace answered with 200 from inside a "no network" box — on a VPS that is
-sshd, the Docker API, Grafana. An `OUTPUT` firewall now closes it:
+The first implementation kept the box on an ordinary bridge and **deleted its
+default route** by privileged exec. It worked, but the isolation then lived in
+the container's network namespace — which a restart rebuilds. A plain
+`docker restart`, exactly what the daemon does at startup under a restart
+policy, silently restored full connectivity:
 
 ```
-$ docker exec --privileged ltd iptables -S OUTPUT
--P OUTPUT DROP
--A OUTPUT -o lo -j ACCEPT
--A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A OUTPUT -d 172.19.0.2/32 -j ACCEPT      # the proxy, --net limited only
+after boxy start:      route: absent    by-IP: no egress      <- isolated
+after docker restart:  route: present   by-IP: HTTP 301       <- fully connected
 ```
 
-The rules are stateful on purpose: inbound SSH arrives by DNAT *from* the
-gateway and replies go back to it, so a blanket drop would cut the connection
-you are sitting on. And they go in by privileged exec, so reading them from
-inside the box fails:
+...while `boxy info` still reported `net none`. That bug is now impossible: the
+same `docker restart` leaves an internal-network box sealed.
+
+Two mechanisms went away with it, both of which existed only to patch holes
+that route-removal left open:
+
+**DNS.** Docker's embedded resolver forwards through the daemon, outside the
+container's netns, so an unrouted box still resolved names and `dig TXT` came
+back with real records — data out in query labels, back in answers. This
+needed a `--dns 127.0.0.1` override. An internal network resolves no external
+name at all, so the override is gone; container names still work, which is how
+the sidecar finds the box.
+
+**The on-link gateway.** Deleting a route only stops traffic that *needs* a
+gateway; the gateway itself is on-link, and a host-netns service answered 200
+from inside a "no network" box. That required a stateful `OUTPUT` firewall,
+installed by privileged exec. An internal network has no gateway to reach.
+
+### The sidecar, and why the box cannot attack it
+
+An internal network costs one thing: **Docker will not bind a host port for a
+container whose only network is internal.** `-p` is accepted and silently
+discarded — no error, an empty binding list, `docker port` prints nothing.
+
+So the box publishes nothing, and a per-box sidecar holds its ports. The
+sidecar is the only container on both the box's network and an ordinary
+bridge, which makes it the obvious thing for a compromised box to attack.
+
+It cannot, because traffic only ever flows host → sidecar → box. The sidecar
+never accepts a connection *from* the box, so its listeners bind to its
+outward address alone — the address on whichever interface owns the default
+route, since the box's internal network has none — and the private side is
+left bare. Probed from inside a box:
 
 ```
-$ sudo iptables -S OUTPUT
-iptables v1.8.9 (nf_tables): Could not fetch rule set generation id:
-Permission denied (you must be root)
+box -> sidecar:2200 (by IP)    REFUSED
+box -> sidecar:2200 (by name)  REFUSED
+port scan 22 / 80 / 2200 / 8888  all closed
+default route via sidecar, then egress   BLOCKED
 ```
 
-Isolation is reapplied on every `start`/`restart`, since a restart rebuilds
-the network namespace and keeps neither the route change nor the firewall.
+It also runs with `--cap-drop=ALL` (`CapBnd:0000000000000000`) and
+`net.ipv4.ip_forward=0`, so there is nothing to escalate to and it cannot be
+made to forward. The one exception is `--net limited`, where the box *must*
+reach the proxy port — that is what `limited` means.
 
 ### `--net limited`
 
@@ -502,7 +512,7 @@ making it the single path out. It refuses any domain not in
 ```
 
 ```
-$ docker logs boxy-proxy-ltd
+$ docker logs boxy-sidecar-ltd
 NOTICE  Proxying refused on filtered domain "example.com"
 ```
 
@@ -554,9 +564,8 @@ exec as boxyboy, HOME=/home/boxyboy, cwd=/work
 
 ## 9. Monitoring
 
-Two tiers, and the light one is the default answer.
-
-**`boxy top`** — no extra services, straight from the daemon:
+`boxy top` reads straight from the daemon — no extra services, no retention,
+nothing to start first:
 
 ```
 $ boxy top
@@ -566,40 +575,11 @@ api       0.03%     12.93MiB / 7.75GiB   0.16%     14.1kB / 12.9kB
 boxy-1    0.04%     14.94MiB / 7.75GiB   0.19%     35.3kB / 34.8kB
 ```
 
-**`boxy monitor up`** — opt-in, for the one question `top` cannot answer:
-*what happened while I wasn't looking?*
-
-```
-$ boxy monitor up
-grafana at http://localhost:3001 (admin / admin on first login)
-prometheus at http://localhost:9090
-```
-
-### Why four containers rather than one
-
-Each does one job, and they are separable:
-
-| Container | Job | Droppable? |
-| --- | --- | --- |
-| cAdvisor | reads the cgroup tree → per-container CPU/mem/net | no — this is the actual data |
-| node-exporter | host CPU/mem/disk headroom | yes, if you only care per-box |
-| Prometheus | stores and queries the history | no — history *is* the feature |
-| Grafana | draws it | yes — Prometheus has its own basic UI at :9090 |
-
-Collapsing them is not really an option: cAdvisor and node-exporter are
-upstream single-purpose exporters, and Prometheus's whole design is that
-collection and storage are separate processes. A genuinely smaller setup means
-choosing a different tool, not merging these.
-
-`--store_container_labels=false` keeps cAdvisor from emitting every Docker
-label as a Prometheus label, which would be a real cardinality problem. Per-box
-series are selected on `container_label_boxy_role="box"` rather than a name
-regex, so custom-named boxes are included and the monitoring stack's own
-containers — and the proxy sidecars — are excluded.
-
-**Cost:** ~830 MB of images (grafana 467, prometheus 269, cadvisor 70,
-node-exporter 23) plus TSDB disk. Off unless you type `boxy monitor up`. On a
-laptop `boxy top` is almost certainly enough.
+A Prometheus/Grafana stack used to live here to answer "what happened while I
+wasn't looking". It cost ~830 MB of images and four containers to answer a
+question that rarely comes up when the boxes are on the laptop in front of
+you, so it was removed with the rest of the remote-host machinery. `boxy top
+--watch` covers the live case.
 
 ---
 
@@ -613,19 +593,20 @@ boxy rm <name>
 
 `boxy logs` is `docker logs` of the box, which is the entrypoint's setup
 narration — host-key generation, authorized-keys install, password set,
-isolation confirmed, clone succeeded or failed. It is the first place to look
-when a box misbehaves, and it is why a failed clone leaves the box *running*
-rather than dead: you can still get in and read why.
+and isolation confirmed. It is the first place to look when a box misbehaves.
+Setup steps that can fail leave the box *running* rather than dead, so you can
+still get in and read why.
 
 ### Where your files live
 
 ```bash
-boxy create -d ~/code/thing    # mount a directory you own
-boxy create                    # fresh scratch dir in $TMPDIR/boxy/
+boxy create .              # mount a directory you own
+boxy create worktree       # a fresh branch of the repo you are in
+boxy create                # fresh scratch dir in $TMPDIR/boxy/
 ```
 
-With `-d`, that directory is mounted at `/work` as-is — never created, never
-moved, never deleted. Without it, boxy makes a fresh directory under
+Given a path, that directory is mounted at `/work` as-is — never created,
+never moved, never deleted. Given nothing, boxy makes a fresh directory under
 `$TMPDIR/boxy/<name>.XXXXXX` (`mktemp`, so a recreated box never inherits a
 previous one's leftovers) and then stops caring about it. Temp directories are
 the OS's job to reap.
@@ -693,32 +674,10 @@ same story (`sudo pkill` silently fails without it), as are
 `NET_BIND_SERVICE` and `AUDIT_WRITE`.
 
 Verified still working under the reduced set: ssh login, sudo to uid 0, ping,
-binding port 80 as an unprivileged user, `pip install`, and `git clone`.
+binding port 80 as an unprivileged user, `pip install`, and `git commit`.
 
 `boxy create --caps default` restores Docker's full 14 — the fastest way to
 rule capabilities in or out when something misbehaves.
-
-### gVisor
-
-```bash
-boxy create --runtime runsc
-```
-
-A user-space kernel: gVisor reimplements the Linux syscall interface in a Go
-process, so a kernel exploit from inside the box hits that reimplementation
-instead of the host kernel.
-
-It earns its keep on a **Linux VPS**, where the container kernel *is* the host
-kernel. On Docker Desktop it is close to pointless, and you can see why:
-
-```
-$ docker run --rm boxy:latest uname -r
-6.12.76-linuxkit          # the VM's kernel — macOS is Darwin 25.5.0
-```
-
-Containers there already run inside a VM, so an escape lands in a disposable
-Linux VM rather than on macOS. gVisor ships with neither Docker nor Docker
-Desktop's VM, so the flag is inert until `runsc` is installed on the host.
 
 ---
 
@@ -752,18 +711,19 @@ host, since a shared Docker daemon is the one resource they cannot sandbox.
 
 ## 13. Known gaps
 
-- **The VPS/tailscale path is wired but untested against real hardware.**
-  `--tailscale` runs `tailscaled` in userspace-networking mode (no
-  `/dev/net/tun`, no `NET_ADMIN`); remote targeting is
-  `docker context create vps --docker "host=ssh://…"`, since boxy only ever
-  talks to `docker`. Both need verifying on an actual VPS.
+- **boxy is local-only by design.** Tailscale, `--runtime runsc` (gVisor),
+  `BOXY_SSH_HOST` and the Prometheus/Grafana stack were all removed rather
+  than left in untested: each existed only for a VPS story, and code that
+  claims a capability it has never demonstrated is worse than no code. Boxy
+  only ever talks to `docker`, so `docker context create vps --docker
+  "host=ssh://…"` remains the obvious re-entry point if that changes.
 - **JAX is CPU-only.** GPU needs a CUDA build target and `jax[cuda12]`
   (amd64 only).
 - **`--net limited`/`none` are guardrails, not a sandbox.** An isolated box
   cannot reach the internet, the host, or another box. It *can* do whatever it
-  likes with what you handed it: the mounted directory is read-write, a
-  mounted git key is readable, and the allowlist constrains where you can talk
-  rather than what you can say — a POST from a limited box reaches
-  `api.github.com` and gets a real answer.
-- **`BOXY_GIT_KEY` is readable by the box user.** Unavoidable if you want to
-  push from inside; use `--no-git-key` or a dedicated deploy key otherwise.
+  likes with what you handed it: the mounted directory is read-write, and the
+  allowlist constrains where you can talk rather than what you can say — a POST
+  from a limited box reaches `api.github.com` and gets a real answer.
+- **A worktree box can rewrite your local git history.** It has the repo's
+  object store mounted read-write, so it can move branches and delete objects.
+  It carries no credentials, so the damage stops at your machine.

@@ -111,20 +111,6 @@ RUN mkdir -p /run/sshd /etc/ssh/hostkeys /etc/ssh/sshd_config.d \
     && chmod 755 /run/sshd \
     && rm -f /etc/ssh/ssh_host_*
 
-# ---------------------------------------------------------------------------
-# Tailscale, for the eventual VPS story
-# ---------------------------------------------------------------------------
-# Installed while still root, before the switch below. tailscaled runs in
-# userspace-networking mode at runtime, so the box needs no /dev/net/tun and
-# no NET_ADMIN capability.
-RUN set -eux; \
-    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg \
-        > /usr/share/keyrings/tailscale-archive-keyring.gpg; \
-    echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian bookworm main" \
-        > /etc/apt/sources.list.d/tailscale.list; \
-    apt-get update && apt-get install -y --no-install-recommends tailscale; \
-    rm -rf /var/lib/apt/lists/*
-
 # ===========================================================================
 # Everything below installs into /opt/conda AS THE BOX USER, so the prefix is
 # writable at runtime (pip install / mamba install without sudo) without a

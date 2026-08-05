@@ -21,7 +21,7 @@ USER_HOME="$(getent passwd "$BOXY_USER" | cut -d: -f6)"
 # `runuser -u X -- cmd` deliberately preserves the caller's environment, so
 # HOME stays /root. Without this, `git config --global` would land in
 # /root/.gitconfig and `git clone` would never see ~boxyboy/.ssh/config — both
-# failing silently, in ways only visible on a --repo or proxied box.
+# failing silently, in ways only visible on a worktree or proxied box.
 as_user() {
     runuser -u "$BOXY_USER" -- env "HOME=$USER_HOME" "USER=$BOXY_USER" "$@"
 }
@@ -161,28 +161,20 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Git identity key
+# 6. Client ssh config
 # ---------------------------------------------------------------------------
-# Mounted read-only at /run/secrets/git_key. It is copied (not symlinked) so
-# the file has container-side ownership and 0400 — a host-side mount can carry
-# a UID the box user cannot read.
-GIT_KEY_SRC="${BOXY_GIT_KEY_PATH:-/run/secrets/git_key}"
+# No keys are installed here. A box's git work is against the shared git dir
+# mounted from the host, so it needs no credentials and reaches no remote.
 SSH_CONF="$SSH_DIR/config"
 : > "$SSH_CONF"
-if [[ -f "$GIT_KEY_SRC" ]]; then
-    install -m 400 -o "$CUR_UID" -g "$CUR_GID" "$GIT_KEY_SRC" "$SSH_DIR/git_key"
-    log "installed git ssh key"
+if [[ -n "${BOXY_PROXY_URL:-}" ]]; then
+    # Strip scheme, then let netcat CONNECT through the allowlist proxy.
+    proxy_hostport="${BOXY_PROXY_URL#*://}"
     cat >> "$SSH_CONF" <<EOF
 Host github.com gitlab.com bitbucket.org ssh.github.com
     User git
-    IdentityFile ~/.ssh/git_key
-    IdentitiesOnly yes
+    ProxyCommand nc -X connect -x $proxy_hostport %h %p
 EOF
-    if [[ -n "${BOXY_PROXY_URL:-}" ]]; then
-        # Strip scheme, then let netcat CONNECT through the allowlist proxy.
-        proxy_hostport="${BOXY_PROXY_URL#*://}"
-        printf '    ProxyCommand nc -X connect -x %s %%h %%p\n' "$proxy_hostport" >> "$SSH_CONF"
-    fi
 fi
 cat >> "$SSH_CONF" <<'EOF'
 
@@ -194,12 +186,12 @@ chown "$CUR_UID:$CUR_GID" "$SSH_CONF"
 chmod 600 "$SSH_CONF"
 
 # ---------------------------------------------------------------------------
-# 7. Workdir / repo clone
+# 7. Workdir
 # ---------------------------------------------------------------------------
 # For an isolated box, boxy removes the default route from the host side just
 # after `docker run` and then drops this marker. Blocking on it closes the
 # window in which a --net none box would still have had a working gateway
-# when the clone below ran.
+# while this script was setting things up.
 if [[ "${BOXY_AWAIT_NETWORK:-0}" == "1" ]]; then
     for _ in $(seq 1 120); do
         [[ -f /run/boxy-net-ready ]] && break
@@ -213,25 +205,19 @@ if [[ "${BOXY_AWAIT_NETWORK:-0}" == "1" ]]; then
 fi
 
 install -d -o "$CUR_UID" -g "$CUR_GID" "$BOXY_WORKDIR"
-if [[ -n "${BOXY_REPO:-}" ]]; then
-    if [[ -n "$(ls -A "$BOXY_WORKDIR" 2>/dev/null)" ]]; then
-        log "workdir not empty — skipping clone of $BOXY_REPO"
-    else
-        log "cloning $BOXY_REPO into $BOXY_WORKDIR"
-        clone_args=(clone --recurse-submodules)
-        [[ -n "${BOXY_REPO_REF:-}" ]] && clone_args+=(--branch "$BOXY_REPO_REF")
-        if ! as_user git "${clone_args[@]}" "$BOXY_REPO" "$BOXY_WORKDIR"; then
-            # A failed clone must not take the box down: you still want to SSH
-            # in and find out why.
-            log "WARNING: clone failed — box is still up, fix it from inside"
-        fi
-    fi
-fi
 # Chown only when ownership actually differs; a large mounted tree is slow.
 if [[ "$(stat -c %u "$BOXY_WORKDIR")" != "$CUR_UID" ]]; then
     chown "$CUR_UID:$CUR_GID" "$BOXY_WORKDIR" || true
 fi
+
+# A bind-mounted tree carries the host's UIDs, which are not this user's, and
+# git refuses to operate on a repo it thinks belongs to someone else. Both
+# paths need naming: /work holds the checkout, and for a worktree the objects
+# and refs live in the separately mounted git dir.
 as_user git config --global --add safe.directory "$BOXY_WORKDIR" || true
+if [[ -n "${BOXY_GIT_COMMON_DIR:-}" ]]; then
+    as_user git config --global --add safe.directory "$BOXY_GIT_COMMON_DIR" || true
+fi
 
 # Land in the workdir. Two places, because they cover different shells:
 #   /etc/profile.d  → login shells (an interactive `ssh box`)
@@ -257,33 +243,6 @@ if ! grep -q '^# >>> boxy >>>' "$BASHRC" 2>/dev/null; then
     # Copy contents rather than mv, to keep the file's existing ownership.
     cat "$boxy_tmp" > "$BASHRC"
     rm -f "$boxy_tmp"
-fi
-
-# ---------------------------------------------------------------------------
-# 8. Tailscale (optional)
-# ---------------------------------------------------------------------------
-# Userspace networking: no /dev/net/tun, no NET_ADMIN. tailscaled proxies
-# inbound tailnet connections to localhost services, so sshd on :22 is
-# reachable at <hostname>:22 on the tailnet with no extra plumbing.
-if [[ -n "${BOXY_TS_AUTHKEY:-}" ]]; then
-    ts_host="${BOXY_TS_HOSTNAME:-$BOXY_NAME}"
-    log "starting tailscaled (userspace) as '$ts_host'"
-    install -d -m 755 /var/lib/tailscale /var/run/tailscale
-    tailscaled --tun=userspace-networking \
-               --socket=/var/run/tailscale/tailscaled.sock \
-               --state=/var/lib/tailscale/tailscaled.state \
-               >/var/log/tailscaled.log 2>&1 &
-    for _ in $(seq 1 30); do
-        [[ -S /var/run/tailscale/tailscaled.sock ]] && break
-        sleep 0.5
-    done
-    if tailscale up --authkey="$BOXY_TS_AUTHKEY" --hostname="$ts_host" \
-            --accept-routes=false --ssh=false; then
-        log "tailscale up: $(tailscale ip -4 2>/dev/null | head -1)"
-    else
-        log "WARNING: tailscale up failed — see /var/log/tailscaled.log"
-    fi
-    unset BOXY_TS_AUTHKEY
 fi
 
 # ---------------------------------------------------------------------------

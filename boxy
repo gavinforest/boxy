@@ -2,8 +2,8 @@
 #
 # boxy — disposable, SSH-reachable dev boxes backed by Docker.
 #
-#   boxy create -d /volume/to/mount
-#   boxy create -r git@github.com:you/repo.git
+#   boxy create .            # mount the current directory
+#   boxy create worktree     # a new worktree of the repo you are in
 #   boxy ls
 #   boxy ssh boxy-1
 #
@@ -30,9 +30,6 @@ BOXY_CONFIG_FILE="${BOXY_CONFIG_FILE:-$BOXY_CONFIG_DIR/config}"
 : "${BOXY_PROXY_IMAGE:=boxy-proxy:latest}"
 : "${BOXY_USER:=boxyboy}"
 
-# Key mounted into the box so git can talk to GitHub. Empty disables it.
-: "${BOXY_GIT_KEY:=$HOME/.ssh/id_ed25519}"
-
 # Where a box's workdir goes when you don't pass -d. The OS reaps temp
 # directories on its own schedule, which is the right owner for scratch space:
 # boxy neither tracks it nor deletes it, so there is no lifecycle to reason
@@ -50,8 +47,7 @@ unset _BOXY_TMP
 # list's ordering is worse than no mapping at all.
 : "${BOXY_PORTS:=2718 8888 8000 8080 3000 5000 6006}"
 
-# Published ports bind to loopback only. On a VPS you reach boxes over
-# tailscale, not by exposing SSH to the internet.
+# Published ports bind to loopback only.
 : "${BOXY_BIND_ADDR:=127.0.0.1}"
 
 # Capability policy: minimal | default.
@@ -75,19 +71,22 @@ unset _BOXY_TMP
 : "${BOXY_CAPS:=minimal}"
 : "${BOXY_MINIMAL_CAPS:=CHOWN DAC_OVERRIDE FOWNER KILL SETGID SETUID SYS_CHROOT NET_BIND_SERVICE NET_RAW AUDIT_WRITE}"
 
-# OCI runtime. Empty means the daemon's default (runc). Set to `runsc` on a
-# host where gVisor is installed to put a user-space kernel between the box
-# and the host kernel — worth doing on a Linux VPS, pointless on Docker
-# Desktop where containers already run inside a VM.
-: "${BOXY_RUNTIME:=}"
-
 : "${BOXY_NET:=full}"
 : "${BOXY_PASSWORD_WORDS:=4}"
-: "${BOXY_RESTART:=unless-stopped}"
-: "${BOXY_TS_AUTHKEY:=}"
+
+# Boxes do not come back on their own.
+#
+# This is a correctness setting, not a convenience one. Egress isolation is
+# applied from OUTSIDE the container — boxy deletes the default route and
+# installs firewall rules after `docker run`. A restart rebuilds the network
+# namespace and both are lost, and the Docker daemon restarting a box at
+# startup does not go through boxy, so nothing puts them back: a `--net none`
+# box would return fully connected while still labelled isolated.
+# `boxy start` re-applies everything, so starting a box deliberately is safe.
+: "${BOXY_RESTART:=no}"
+
 : "${BOXY_CPUS:=}"
 : "${BOXY_MEMORY:=}"
-: "${BOXY_SSH_HOST:=127.0.0.1}"
 
 WORDLIST_URL="https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt"
 WORDLIST_COUNT=7776
@@ -423,95 +422,32 @@ ensure_allowlist() {
 # Networks
 # ===========================================================================
 # Restricted boxes get their own ordinary bridge:
-#   boxy-iso-<name>   the box (and, for `limited`, its proxy) live here
-#   boxy-egress       ordinary bridge — only proxies live here
-# The proxy sits on both, which makes it the single, auditable way out.
-#
-# Note what is NOT used: `docker network create --internal`. It does block
-# egress, but it also drops the inbound traffic that published ports depend
-# on, so an isolated box becomes unreachable over SSH — which defeats the
-# entire premise. Isolation is done by route removal instead; see
-# isolate_network().
+#   boxy-iso-<name>   INTERNAL. The box lives here alone; Docker itself
+#                     guarantees no egress, and there is nothing to reapply
+#                     after a restart because it is a property of the network.
+#   boxy-egress       ordinary bridge — only sidecars live here
+# The sidecar sits on both, which makes it the single, auditable way in or out.
 
+# `internal` here is the whole of boxy's egress isolation.
+#
+# Docker enforces it in the network itself: no default route is installed, no
+# NAT rule exists for the subnet, and external DNS resolution is dead. Unlike
+# anything applied to a running container, it is part of the network's
+# definition, so it survives a restart and cannot be undone from inside the
+# box — there is no state for a restart to rebuild wrongly.
+#
+# The cost is that Docker will not create a host port binding for a container
+# whose only network is internal: `-p` is accepted and silently discarded, and
+# `docker port` reports nothing. Published ports therefore live on the sidecar,
+# which is dual-homed. See create_prepare_network.
 ensure_network() {
-    local net="$1"
+    local net="$1" internal="${2:-0}"
     docker network inspect "$net" >/dev/null 2>&1 && return 0
-    docker network create "$net" >/dev/null
-}
-
-# Cut a box off from everything except its own subnet.
-#
-# Deleting the default route leaves on-link traffic working — replies to
-# published ports reach the host, and the egress proxy on the same subnet is
-# still reachable — while anything needing a gateway goes nowhere.
-#
-# The crucial detail is WHERE this runs. `docker exec --privileged` grants
-# privileges to the exec'd process alone, so the container itself never holds
-# CAP_NET_ADMIN. The box user has sudo, but `ip route add default` inside the
-# box comes back "Operation not permitted": root in the box cannot undo it.
-isolate_network() {
-    local name="$1" tries=0
-    while [ "$tries" -lt 40 ]; do
-        docker exec --privileged "$name" ip route del default >/dev/null 2>&1 && break
-        docker exec "$name" ip route show default 2>/dev/null | grep -q . || break
-        sleep 0.25
-        tries=$(( tries + 1 ))
-    done
-
-    if docker exec "$name" ip route show default 2>/dev/null | grep -q .; then
-        warn "could not remove the default route from $name — egress is NOT restricted"
-        return 1
+    if [ "$internal" = "1" ]; then
+        docker network create --internal "$net" >/dev/null
+    else
+        docker network create "$net" >/dev/null
     fi
-
-    firewall_box "$name" || warn "$name: on-link egress is not firewalled (see boxy logs)"
-
-    # Release the entrypoint, which blocks on this marker before doing
-    # anything network-dependent (notably the repo clone). Without it there is
-    # a window where an isolated box still has a working gateway.
-    docker exec "$name" touch /run/boxy-net-ready >/dev/null 2>&1 || true
-    return 0
-}
-
-# The IP a container holds on one specific network.
-container_ip_on() {
-    docker inspect -f "{{with index .NetworkSettings.Networks \"$2\"}}{{.IPAddress}}{{end}}" \
-        "$1" 2>/dev/null || true
-}
-
-# Close the on-link hole that route removal leaves open.
-#
-# Deleting the default route only stops traffic that NEEDS a gateway. The
-# gateway itself is on-link, so an isolated box could still reach anything in
-# the host's network namespace — on a Linux VPS that is sshd, a TCP-exposed
-# Docker API, Grafana, a database. Verified reachable before this existed.
-#
-# The rules are stateful on purpose. Inbound SSH arrives by DNAT from the
-# gateway and the box's replies go back to that same gateway address, so a
-# blanket "drop everything to the gateway" would cut the connection you are
-# sitting on. Allowing ESTABLISHED,RELATED keeps replies flowing while denying
-# anything the box initiates.
-#
-# Installed via `docker exec --privileged`, so the capability belongs to this
-# one exec'd process and never to the container: `sudo iptables` inside the
-# box fails the same way `sudo ip route add default` does.
-firewall_box() {
-    local name="$1" net proxy_ip="" rules
-    net="$(inst_label "$name" boxy.net)"
-    if [ "$net" = "limited" ]; then
-        proxy_ip="$(container_ip_on "boxy-proxy-$name" "boxy-iso-$name")"
-        [ -n "$proxy_ip" ] || { warn "$name: could not find the proxy's address"; return 1; }
-    fi
-
-    rules='set -e
-iptables -F OUTPUT
-iptables -A OUTPUT -o lo -j ACCEPT
-iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'
-    [ -n "$proxy_ip" ] && rules="$rules
-iptables -A OUTPUT -d $proxy_ip -j ACCEPT"
-    rules="$rules
-iptables -P OUTPUT DROP"
-
-    printf '%s\n' "$rules" | docker exec --privileged -i "$name" sh -s >/dev/null 2>&1
 }
 
 remove_network_if_unused() {
@@ -570,21 +506,28 @@ EOF
 # ===========================================================================
 usage_create() {
     cat >&2 <<'EOF'
-usage: boxy create [options]
+usage: boxy create [TARGET] [options]
 
-  -d, --dir DIR         mount DIR at /work (default: fresh scratch dir in $TMPDIR)
-  -r, --repo URL        clone URL into /work on first boot
-  -b, --ref REF         branch/tag to clone (with --repo)
+TARGET says what lands in /work:
+
+  .  or PATH    mount that directory              boxy create .
+  worktree      a new git worktree of the repo    boxy create worktree
+                you are standing in
+  (omitted)     a fresh scratch dir in $TMPDIR    boxy create
+
+The worktree gets its own branch (boxy/NAME) and shares history with your
+repo, so commits made in the box are in your repo the moment they land.
+Your main checkout is not mounted and cannot be touched.
+
+options:
+  -b, --ref REF         commit-ish the worktree branches from (default: HEAD)
   -n, --name NAME       instance name (default: boxy-N)
       --password PASS   sudo password (default: random EFF-wordlist passphrase)
       --words N         words in the generated passphrase (default: 4)
   -u, --user NAME       login user inside the box (default: boxyboy)
   -k, --key PATH        public key to authorize (default: $BOXY_SSH_KEY.pub)
-      --git-key PATH    private key mounted for git (default: ~/.ssh/id_ed25519)
-      --no-git-key      do not mount any git key
       --net MODE        full | none | limited          (default: full)
       --caps MODE       minimal | default capability set (default: minimal)
-      --runtime NAME    OCI runtime, e.g. runsc          (default: daemon's)
       --allow DOMAIN    extra allowed domain for --net limited (repeatable)
   -p, --publish SPEC    publish a port, docker-style (repeatable):
                           -p 2718        -> localhost:2718 -> container 2718
@@ -592,8 +535,6 @@ usage: boxy create [options]
                         Default is none; use `boxy forward` instead.
   -v, --volume SRC:DST  extra bind mount (repeatable)
   -e, --env K=V         extra environment variable (repeatable)
-      --tailscale       join the tailnet (needs BOXY_TS_AUTHKEY)
-      --ts-hostname H   tailnet hostname (default: instance name)
       --image IMG       image to run (default: boxy:latest)
       --cpus N          CPU limit
       --memory SIZE     memory limit, e.g. 8g
@@ -626,16 +567,16 @@ cmd_create() {
 # is prefixed NB_ ("new box"), written only by create_* functions, and cleared
 # at the start of every run so nothing leaks between invocations.
 nb_reset() {
-    NB_MOUNT_DIR=""; NB_REPO=""; NB_REF=""; NB_NAME=""
+    NB_TARGET=""; NB_SOURCE=""; NB_MOUNT_DIR=""; NB_REF=""; NB_NAME=""
+    NB_WT_REPO=""; NB_WT_GITDIR=""; NB_WT_BRANCH=""
     NB_PASSWORD=""; NB_PW_HASH=""; NB_PW_GENERATED=0
     NB_WORDS="$BOXY_PASSWORD_WORDS"; NB_USER="$BOXY_USER"; NB_PUBKEY=""
-    NB_GIT_KEY="$BOXY_GIT_KEY"; NB_NO_GIT_KEY=0
     NB_NET="$BOXY_NET"; NB_IMAGE="$BOXY_IMAGE"
-    NB_CAPS="$BOXY_CAPS"; NB_RUNTIME="$BOXY_RUNTIME"
-    NB_USE_TS=0; NB_TS_HOST=""; NB_CPUS="$BOXY_CPUS"; NB_MEMORY="$BOXY_MEMORY"
+    NB_CAPS="$BOXY_CAPS"
+    NB_CPUS="$BOXY_CPUS"; NB_MEMORY="$BOXY_MEMORY"
     NB_IDX=""; NB_SSH_PORT=""; NB_PUBLISHED=""
     NB_SDIR=""; NB_WORKDIR=""; NB_AUTHORIZED_KEYS=""
-    NB_NET_NAME=""; NB_PROXY_NAME=""; NB_PROXY_URL=""
+    NB_NET_NAME=""; NB_SIDECAR_NAME=""; NB_PROXY_URL=""
     NB_ALLOW=(); NB_VOLS=(); NB_ENVS=(); NB_PUBLISH=()
     RUN_ARGS=()
 }
@@ -661,30 +602,30 @@ nb_push_publish() { NB_PUBLISH[${#NB_PUBLISH[@]}]="$1"; }
 create_parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            -d|--dir)       NB_MOUNT_DIR="${2:?--dir needs a value}";      shift 2 ;;
-            -r|--repo)      NB_REPO="${2:?--repo needs a value}";          shift 2 ;;
             -b|--ref)       NB_REF="${2:?--ref needs a value}";            shift 2 ;;
             -n|--name)      NB_NAME="${2:?--name needs a value}";          shift 2 ;;
             --password)     NB_PASSWORD="${2:?--password needs a value}";  shift 2 ;;
             --words)        NB_WORDS="${2:?--words needs a value}";        shift 2 ;;
             -u|--user)      NB_USER="${2:?--user needs a value}";          shift 2 ;;
             -k|--key)       NB_PUBKEY="${2:?--key needs a value}";         shift 2 ;;
-            --git-key)      NB_GIT_KEY="${2:?--git-key needs a value}";    shift 2 ;;
-            --no-git-key)   NB_NO_GIT_KEY=1;                               shift ;;
             --net)          NB_NET="${2:?--net needs a value}";            shift 2 ;;
             --caps)         NB_CAPS="${2:?--caps needs a value}";          shift 2 ;;
-            --runtime)      NB_RUNTIME="${2:?--runtime needs a value}";    shift 2 ;;
             --allow)        nb_push_allow   "${2:?--allow needs a value}"; shift 2 ;;
             -p|--publish)   nb_push_publish "${2:?--publish needs a value}"; shift 2 ;;
             -v|--volume)    nb_push_vol     "${2:?--volume needs a value}"; shift 2 ;;
             -e|--env)       nb_push_env     "${2:?--env needs a value}";   shift 2 ;;
-            --tailscale)    NB_USE_TS=1;                                   shift ;;
-            --ts-hostname)  NB_TS_HOST="${2:?--ts-hostname needs a value}"; shift 2 ;;
             --image)        NB_IMAGE="${2:?--image needs a value}";        shift 2 ;;
             --cpus)         NB_CPUS="${2:?--cpus needs a value}";          shift 2 ;;
             --memory)       NB_MEMORY="${2:?--memory needs a value}";      shift 2 ;;
             -h|--help)      usage_create; return 1 ;;
-            *)              die "create: unknown option $1 (try 'boxy create --help')" ;;
+            -*)             die "create: unknown option $1 (try 'boxy create --help')" ;;
+            # The one positional: what goes in /work. Accepted before or after
+            # the flags, so both `boxy create . -n web` and `boxy create -n web .`
+            # read naturally.
+            *)
+                [ -z "$NB_TARGET" ] \
+                    || die "create: one target at a time (got '$NB_TARGET' and '$1')"
+                NB_TARGET="$1"; shift ;;
         esac
     done
     return 0
@@ -708,14 +649,7 @@ create_validate() {
         printf '%s' "$NB_NAME" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$' \
             || die "--name '$NB_NAME' is not a usable container name: needs 2+ characters, starting with a letter or digit, then letters, digits, '_', '.' or '-'"
     fi
-    if [ -n "$NB_MOUNT_DIR" ] && [ -n "$NB_REPO" ]; then
-        die "--dir and --repo are mutually exclusive (mount a dir, or clone into a fresh one)"
-    fi
-    # Checked here rather than where the mount is set up, so a typo'd path
-    # fails before boxy generates a keypair and allocates ports.
-    if [ -n "$NB_MOUNT_DIR" ] && [ ! -d "$NB_MOUNT_DIR" ]; then
-        die "--dir: not a directory: $NB_MOUNT_DIR"
-    fi
+    create_resolve_target
 
     image_exists "$NB_IMAGE" || die "image '$NB_IMAGE' not found — run: boxy build"
     if [ "$NB_NET" = "limited" ]; then
@@ -728,6 +662,51 @@ create_validate() {
     [ -n "$NB_PUBKEY" ] || NB_PUBKEY="$BOXY_SSH_KEY.pub"
     [ -f "$NB_PUBKEY" ] || die "public key not found: $NB_PUBKEY"
     NB_AUTHORIZED_KEYS="$(cat "$NB_PUBKEY")"
+}
+
+# Work out what the single positional means, and prove it can work before
+# create allocates ports, generates a password or builds any directories.
+#
+# Three sources, one of which needs a git repo under the cursor:
+#   ""         scratch   a fresh temp dir
+#   worktree   worktree  a new worktree of the repo containing $PWD
+#   PATH       dir       that directory, mounted as-is
+create_resolve_target() {
+    case "$NB_TARGET" in
+        "")
+            NB_SOURCE="scratch" ;;
+        worktree)
+            # A directory can also be named "worktree". The keyword wins,
+            # because it is what you meant almost every time, and ./worktree
+            # says the other thing unambiguously. An `if` rather than
+            # `[ … ] && die`, which under `set -e` is only safe as long as it
+            # is not the last statement in its branch.
+            if [ -e "worktree" ]; then
+                die "'worktree' here is also a real path — write ./worktree to mount that directory, or run boxy create worktree from elsewhere"
+            fi
+            NB_SOURCE="worktree"
+            create_resolve_worktree ;;
+        *)
+            NB_SOURCE="dir"
+            [ -d "$NB_TARGET" ] || die "not a directory: $NB_TARGET"
+            NB_MOUNT_DIR="$NB_TARGET" ;;
+    esac
+
+    if [ -n "$NB_REF" ] && [ "$NB_SOURCE" != "worktree" ]; then
+        die "--ref only means something with 'boxy create worktree'"
+    fi
+}
+
+# Locate the repo to branch from, and confirm the ref resolves. Nothing is
+# created here; that happens in create_prepare_dirs once the name is known.
+create_resolve_worktree() {
+    command -v git >/dev/null 2>&1 || die "boxy create worktree needs git on PATH"
+    git rev-parse --git-dir >/dev/null 2>&1 \
+        || die "boxy create worktree must be run inside a git repository"
+
+    NB_WT_REPO="$(git rev-parse --show-toplevel)"
+    git rev-parse --verify --quiet "${NB_REF:-HEAD}^{commit}" >/dev/null \
+        || die "--ref '$NB_REF' does not name a commit in $NB_WT_REPO"
 }
 
 # Normalise -p specs, then claim an instance index and its SSH port.
@@ -773,19 +752,62 @@ create_prepare_dirs() {
     mkdir -p "$NB_SDIR/hostkeys"
     chmod 700 "$NB_SDIR"
 
-    # A -d directory is yours: mounted as-is, never created, never removed.
-    # Otherwise the box gets fresh scratch space in the OS temp area. mktemp
-    # rather than a fixed path per name, so a recreated box never inherits a
-    # previous one's leftovers — which would, among other things, silently
-    # skip a --repo clone because the workdir looked non-empty.
-    if [ -n "$NB_MOUNT_DIR" ]; then
-        [ -d "$NB_MOUNT_DIR" ] || die "not a directory: $NB_MOUNT_DIR"
-        NB_WORKDIR="$(cd "$NB_MOUNT_DIR" && pwd)"
-    else
-        mkdir -p "$BOXY_WORKDIR_BASE"
-        NB_WORKDIR="$(mktemp -d "$BOXY_WORKDIR_BASE/$NB_NAME.XXXXXX")" \
-            || die "could not create a workdir under $BOXY_WORKDIR_BASE"
-    fi
+    case "$NB_SOURCE" in
+        # A directory you named is yours: mounted as-is, never created,
+        # never removed.
+        dir)
+            NB_WORKDIR="$(cd "$NB_MOUNT_DIR" && pwd)" ;;
+        # Scratch space in the OS temp area. mktemp rather than a fixed path
+        # per name, so a recreated box never inherits a previous one's files.
+        scratch)
+            NB_WORKDIR="$(new_scratch_dir)" ;;
+        worktree)
+            NB_WORKDIR="$(new_scratch_dir)"
+            NB_WT_BRANCH="$(unused_branch_name "$NB_WT_REPO" "boxy/$NB_NAME")"
+            info "adding worktree $NB_WT_BRANCH to $NB_WT_REPO"
+            # git is happy to populate an existing empty directory, which is
+            # what mktemp -d just handed us.
+            git -C "$NB_WT_REPO" worktree add --quiet \
+                -b "$NB_WT_BRANCH" "$NB_WORKDIR" "${NB_REF:-HEAD}" \
+                || die "git worktree add failed"
+            NB_WT_GITDIR="$(worktree_git_common_dir "$NB_WORKDIR")"
+            ;;
+    esac
+}
+
+# Read back the path git itself wrote, rather than deriving one and hoping it
+# matches. A worktree's .git is a file holding
+#     gitdir: /abs/path/to/repo/.git/worktrees/<name>
+# and that exact string is what git will follow from inside the container, so
+# it is the only correct thing to mount. Deriving it instead with `cd … && pwd`
+# is wrong on macOS, where /tmp is a symlink to /private/tmp: git records the
+# physical path, the shell reports the logical one, and the mount lands beside
+# the pointer rather than under it — leaving a box whose repo does not open.
+worktree_git_common_dir() {
+    local ptr common
+    ptr="$(sed -n 's/^gitdir: //p' "$1/.git" 2>/dev/null)"
+    [ -n "$ptr" ] || die "worktree at $1 has no gitdir pointer"
+    common="${ptr%/worktrees/*}"
+    [ -d "$common" ] || die "worktree points at $common, which is not a directory"
+    printf '%s' "$common"
+}
+
+new_scratch_dir() {
+    mkdir -p "$BOXY_WORKDIR_BASE"
+    mktemp -d "$BOXY_WORKDIR_BASE/$NB_NAME.XXXXXX" \
+        || die "could not create a workdir under $BOXY_WORKDIR_BASE"
+}
+
+# boxy rm deliberately keeps a worktree's branch — it may hold the only copy
+# of the work. So names get reused: create boxy-1, rm it, create boxy-1 again,
+# and boxy/boxy-1 is still there. Suffix rather than fail.
+unused_branch_name() {
+    local repo="$1" base="$2" n=2 candidate="$2"
+    while git -C "$repo" show-ref --verify --quiet "refs/heads/$candidate"; do
+        candidate="$base-$n"
+        n=$(( n + 1 ))
+    done
+    printf '%s' "$candidate"
 }
 
 create_prepare_password() {
@@ -800,40 +822,77 @@ create_prepare_password() {
     ( umask 077; printf '%s\n' "$NB_PASSWORD" > "$NB_SDIR/password" )
 }
 
+# An isolated box sits alone on an `internal` network and publishes nothing.
+# Everything that has to reach it — SSH included — arrives through a sidecar
+# that is the only container on both that network and the outside.
+#
+# Why the sidecar is not itself an attack surface for the box: traffic only
+# ever flows host -> sidecar -> box, so the sidecar never needs to accept a
+# connection from the box. Its listeners bind to its outward address only, and
+# the private side is left bare — verified from inside a box: every port
+# closed, by IP and by name, and no route out even when handed one explicitly.
+# It also runs with no capabilities and with IP forwarding switched off, so it
+# cannot be turned into a router.
 create_prepare_network() {
-    case "$NB_NET" in
-        full)    NB_NET_NAME="boxy-net" ;;
-        *)       NB_NET_NAME="boxy-iso-$NB_NAME" ;;
-    esac
-    ensure_network "$NB_NET_NAME"
-    [ "$NB_NET" = "limited" ] || return 0
+    if [ "$NB_NET" = "full" ]; then
+        NB_NET_NAME="boxy-net"
+        ensure_network "$NB_NET_NAME"
+        return 0
+    fi
 
-    ensure_network "boxy-egress"
-    NB_PROXY_NAME="boxy-proxy-$NB_NAME"
-    NB_PROXY_URL="http://$NB_PROXY_NAME:8888"
+    NB_NET_NAME="boxy-iso-$NB_NAME"
+    ensure_network "$NB_NET_NAME" 1          # internal: Docker enforces egress
+    ensure_network "boxy-egress"             # the sidecar's outward network
+    NB_SIDECAR_NAME="boxy-sidecar-$NB_NAME"
 
-    local allowlist a
-    allowlist="$(grep -v '^[[:space:]]*#' "$(allowlist_file)" | grep -v '^[[:space:]]*$' || true)"
-    for a in ${NB_ALLOW[@]+"${NB_ALLOW[@]}"}; do
-        allowlist="$allowlist
-$a"
+    # Ingress map, one "listenport:box:targetport" per line. The listen port
+    # equals the host port so the two never have to be reasoned about apart.
+    local relay pair
+    relay="$NB_SSH_PORT:$NB_NAME:22"
+    for pair in $NB_PUBLISHED; do
+        relay="$relay
+${pair%%:*}:$NB_NAME:${pair##*:}"
     done
-    [ -n "$allowlist" ] || die "egress allowlist is empty; nothing would be reachable"
 
-    info "starting egress proxy $NB_PROXY_NAME"
+    local caps="--cap-drop=ALL"
+    local envs=()
+    if [ "$NB_NET" = "limited" ]; then
+        NB_PROXY_URL="http://$NB_SIDECAR_NAME:8888"
+        local allowlist a
+        allowlist="$(grep -v '^[[:space:]]*#' "$(allowlist_file)" | grep -v '^[[:space:]]*$' || true)"
+        for a in ${NB_ALLOW[@]+"${NB_ALLOW[@]}"}; do
+            allowlist="$allowlist
+$a"
+        done
+        [ -n "$allowlist" ] || die "egress allowlist is empty; nothing would be reachable"
+        envs[${#envs[@]}]="-e"; envs[${#envs[@]}]="BOXY_ALLOWLIST=$allowlist"
+        # tinyproxy starts as root and drops to its own user, which needs these
+        # two back. socat alone needs nothing.
+        caps="$caps --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP"
+    fi
+
+    info "starting sidecar $NB_SIDECAR_NAME"
+    # shellcheck disable=SC2086
     docker run -d \
-        --name "$NB_PROXY_NAME" \
-        --hostname "$NB_PROXY_NAME" \
+        --name "$NB_SIDECAR_NAME" \
+        --hostname "$NB_SIDECAR_NAME" \
         --restart "$BOXY_RESTART" \
         --network "boxy-egress" \
+        $caps \
+        --sysctl net.ipv4.ip_forward=0 \
         --label boxy.managed=1 \
-        --label boxy.role=proxy \
+        --label boxy.role=sidecar \
         --label "boxy.instance=$NB_NAME" \
-        -e "BOXY_ALLOWLIST=$allowlist" \
+        -p "$BOXY_BIND_ADDR:$NB_SSH_PORT:$NB_SSH_PORT" \
+        $(for pair in $NB_PUBLISHED; do printf -- '-p %s:%s:%s ' "$BOXY_BIND_ADDR" "${pair%%:*}" "${pair%%:*}"; done) \
+        -e "BOXY_RELAY=$relay" \
+        ${envs[@]+"${envs[@]}"} \
         "$BOXY_PROXY_IMAGE" >/dev/null
-    # Second attachment: the proxy becomes reachable by name from the box's
-    # isolated network while keeping its own route out.
-    docker network connect "$NB_NET_NAME" "$NB_PROXY_NAME"
+
+    # Second attachment, after creation: the port bindings above only exist
+    # because the sidecar was created on a non-internal network. Attaching the
+    # box's network now lets it reach the box without giving the box anything.
+    docker network connect "$NB_NET_NAME" "$NB_SIDECAR_NAME"
 }
 
 create_assemble_run_args() {
@@ -848,26 +907,41 @@ create_assemble_run_args() {
     arg --label "boxy.ssh_port=$NB_SSH_PORT"
     arg --label "boxy.published=$NB_PUBLISHED"
     arg --label "boxy.workdir=$NB_WORKDIR"
+    arg --label "boxy.source=$NB_SOURCE"
+    arg --label "boxy.worktree_repo=$NB_WT_REPO"
+    arg --label "boxy.worktree_branch=$NB_WT_BRANCH"
     arg --label "boxy.net=$NB_NET"
     arg --label "boxy.caps=$NB_CAPS"
     arg --label "boxy.user=$NB_USER"
     arg --label "boxy.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-    arg -p "$BOXY_BIND_ADDR:$NB_SSH_PORT:22"
-    local pair
-    for pair in $NB_PUBLISHED; do
-        arg -p "$BOXY_BIND_ADDR:${pair%%:*}:${pair##*:}"
-    done
+    # Only a `full` box binds host ports itself. An isolated box is alone on
+    # an internal network, where Docker discards `-p` without a word, so its
+    # bindings live on the sidecar instead.
+    if [ "$NB_NET" = "full" ]; then
+        arg -p "$BOXY_BIND_ADDR:$NB_SSH_PORT:22"
+        local pair
+        for pair in $NB_PUBLISHED; do
+            arg -p "$BOXY_BIND_ADDR:${pair%%:*}:${pair##*:}"
+        done
+    fi
 
     arg -v "$NB_WORKDIR:/work"
     arg -v "$NB_SDIR/hostkeys:/etc/ssh/hostkeys"
-    if [ "$NB_NO_GIT_KEY" = "0" ] && [ -n "$NB_GIT_KEY" ]; then
-        if [ -f "$NB_GIT_KEY" ]; then
-            arg -v "$NB_GIT_KEY:/run/secrets/git_key:ro"
-        else
-            warn "git key $NB_GIT_KEY not found — the box will have no git credentials"
-        fi
+
+    # A worktree's .git is a *file* holding an absolute path to the main
+    # repository's git dir — a host path, which means /work alone is a broken
+    # repo inside the box. Mounting the shared git dir at the very path the
+    # pointer names makes it whole, and makes it the same object the host has,
+    # so a commit in the box is on the branch in your repo immediately.
+    #
+    # Note what is NOT mounted: your main checkout. The box shares history and
+    # nothing else.
+    if [ -n "$NB_WT_GITDIR" ]; then
+        arg -v "$NB_WT_GITDIR:$NB_WT_GITDIR"
+        arg -e "BOXY_GIT_COMMON_DIR=$NB_WT_GITDIR"
     fi
+
     local v
     for v in ${NB_VOLS[@]+"${NB_VOLS[@]}"}; do arg -v "$v"; done
 
@@ -875,28 +949,8 @@ create_assemble_run_args() {
     arg -e "BOXY_USER=$NB_USER"
     arg -e "BOXY_AUTHORIZED_KEYS=$NB_AUTHORIZED_KEYS"
     arg -e "BOXY_PASSWORD_HASH=$NB_PW_HASH"
-    [ -n "$NB_REPO" ]      && arg -e "BOXY_REPO=$NB_REPO"
-    [ -n "$NB_REF" ]       && arg -e "BOXY_REPO_REF=$NB_REF"
     [ -n "$NB_PROXY_URL" ] && arg -e "BOXY_PROXY_URL=$NB_PROXY_URL"
 
-    # Tell the entrypoint to block on the isolation marker before it clones.
-    [ "$NB_NET" != "full" ] && arg -e "BOXY_AWAIT_NETWORK=1"
-
-    # Deny an isolated box a working resolver.
-    #
-    # Docker's embedded DNS at 127.0.0.11 forwards queries through the daemon,
-    # which lives OUTSIDE the container's network namespace — so removing the
-    # default route does not touch it. A --net none box with no route to
-    # anywhere can still resolve arbitrary names, which is a bidirectional
-    # covert channel: data leaves encoded in query labels and comes back in
-    # TXT records. Verified working before this line existed.
-    #
-    # Pointing the upstream at 127.0.0.1, where nothing listens, kills
-    # external resolution. The embedded server still answers container names
-    # from its own table, which is all the box needs to find its proxy — and
-    # a proxied client sends the hostname to the proxy to resolve, so it never
-    # needed external DNS in the first place.
-    [ "$NB_NET" != "full" ] && arg --dns 127.0.0.1
 
     # Match the host user's ids so bind-mounted files are not owned by a
     # stranger — but only on Linux, where a bind mount passes numeric
@@ -907,11 +961,6 @@ create_assemble_run_args() {
         arg -e "BOXY_UID=$(id -u)" -e "BOXY_GID=$(id -g)"
     fi
 
-    if [ "$NB_USE_TS" = "1" ]; then
-        [ -n "$BOXY_TS_AUTHKEY" ] || die "--tailscale needs BOXY_TS_AUTHKEY (config or environment)"
-        arg -e "BOXY_TS_AUTHKEY=$BOXY_TS_AUTHKEY"
-        arg -e "BOXY_TS_HOSTNAME=${NB_TS_HOST:-$NB_NAME}"
-    fi
     local ev
     for ev in ${NB_ENVS[@]+"${NB_ENVS[@]}"}; do arg -e "$ev"; done
 
@@ -925,9 +974,6 @@ create_assemble_run_args() {
         for cap in $BOXY_MINIMAL_CAPS; do arg --cap-add="$cap"; done
     fi
 
-    # A non-default OCI runtime (gVisor's runsc, Kata). Left empty, the daemon
-    # picks its own — so this is inert until the host actually has one.
-    [ -n "$NB_RUNTIME" ] && arg --runtime "$NB_RUNTIME"
     return 0
 }
 
@@ -935,13 +981,10 @@ create_launch() {
     if ! docker run "${RUN_ARGS[@]}" "$NB_IMAGE" >/dev/null; then
         # Roll back anything this run created, so a failed create does not
         # leave a half-built box behind.
-        [ -n "$NB_PROXY_NAME" ] && docker rm -f "$NB_PROXY_NAME" >/dev/null 2>&1
+        [ -n "$NB_SIDECAR_NAME" ] && docker rm -f "$NB_SIDECAR_NAME" >/dev/null 2>&1
         [ "$NB_NET" != "full" ] && remove_network_if_unused "$NB_NET_NAME"
         die "docker run failed"
     fi
-
-    # Cut egress before anything inside the box can use it.
-    [ "$NB_NET" != "full" ] && { isolate_network "$NB_NAME" || true; }
 
     if ! wait_for_ready "$NB_NAME"; then
         warn "the box did not become SSH-reachable within the timeout. Recent logs:"
@@ -958,11 +1001,15 @@ create_report() {
     printf '  %sssh%s     ssh -F %s %s        %s(or: boxy ssh %s)%s\n' \
         "$C_BLD" "$C_OFF" "$(ssh_config_path)" "$NB_NAME" "$C_DIM" "$NB_NAME" "$C_OFF"
     printf '  %sdirect%s  ssh -p %s -i %s %s@%s\n' \
-        "$C_BLD" "$C_OFF" "$NB_SSH_PORT" "$BOXY_SSH_KEY" "$NB_USER" "$BOXY_SSH_HOST"
+        "$C_BLD" "$C_OFF" "$NB_SSH_PORT" "$BOXY_SSH_KEY" "$NB_USER" "127.0.0.1"
     printf '  %sworkdir%s %s -> /work\n' "$C_BLD" "$C_OFF" "$NB_WORKDIR"
+    if [ -n "$NB_WT_BRANCH" ]; then
+        printf '  %sbranch%s  %s   %s(shares history with %s)%s\n' \
+            "$C_BLD" "$C_OFF" "$NB_WT_BRANCH" "$C_DIM" "$NB_WT_REPO" "$C_OFF"
+    fi
 
     printf '  %snet%s     %s' "$C_BLD" "$C_OFF" "$NB_NET"
-    [ -n "$NB_PROXY_URL" ] && printf ' (proxy %s)' "$NB_PROXY_NAME"
+    [ -n "$NB_SIDECAR_NAME" ] && printf ' (sidecar %s)' "$NB_SIDECAR_NAME"
     printf '\n'
 
     if [ "$NB_PW_GENERATED" = "1" ]; then
@@ -1037,7 +1084,7 @@ write_known_hosts() {
     : > "$sdir/known_hosts"
     for pubfile in "$sdir"/hostkeys/*.pub; do
         [ -f "$pubfile" ] || continue
-        printf '[%s]:%s %s\n' "$BOXY_SSH_HOST" "$port" "$(cut -d' ' -f1,2 < "$pubfile")" \
+        printf '[%s]:%s %s\n' "127.0.0.1" "$port" "$(cut -d' ' -f1,2 < "$pubfile")" \
             >> "$sdir/known_hosts"
     done
     chmod 600 "$sdir/known_hosts"
@@ -1065,7 +1112,7 @@ write_ssh_config() {
             user="$(inst_label "$name" boxy.user)"
             sdir="$(state_dir_for "$name")"
             printf 'Host %s\n' "$name"
-            printf '    HostName %s\n' "$BOXY_SSH_HOST"
+            printf '    HostName %s\n' "127.0.0.1"
             printf '    Port %s\n' "$port"
             printf '    User %s\n' "$user"
             printf '    IdentityFile %s\n' "$BOXY_SSH_KEY"
@@ -1142,9 +1189,79 @@ cmd_ls() {
     done
 }
 
+# Reality checks against the labels.
+#
+# A label records what you ASKED FOR at create time. Most of them cannot
+# subsequently be wrong — ssh_port and published agree with `docker port` by
+# construction, and user/caps/created are fixed for the life of the container.
+# Four can drift, all of them verified to do so:
+#
+#   workdir          you deleted or moved the directory; /work silently
+#                    becomes an empty mount rather than an error
+#   worktree_repo    same, for the repository the box branches from
+#   worktree_branch  you renamed the branch, or the box checked out another
+#
+# `net` used to belong on that list. It no longer can: isolation is a property
+# of the box's network, which Docker enforces and a restart cannot undo.
+#
+# These print ALONGSIDE the label, never instead of it. The label is what you
+# asked for and the divergence is the news; replacing one with the other would
+# hide exactly the failure worth reporting — a box that reads `net none` while
+# holding a route out is the bug, and showing `net full` would erase it.
+#
+# All three are answered entirely on the host — /work and the git dir are bind
+# mounts, so the host and the box see identical bytes. Nothing here enters the
+# container, so there is no flag to opt out of and nothing a box could spoof.
+check_workdir() {
+    local wd="$1"
+    [ -n "$wd" ] || return 0
+    [ -d "$wd" ] || printf '%s' "MISSING on the host"
+}
+check_repo() {
+    local repo="$1"
+    [ -n "$repo" ] || return 0
+    [ -d "$repo" ] || printf '%s' "MISSING on the host"
+}
+
+# Which branch the worktree is actually on — read on the HOST.
+#
+# There is nothing to ask the container. /work is a bind mount of a host
+# directory and the git dir is a host directory, so the box and the host are
+# looking at the same bytes: a `git checkout` performed inside the box is
+# visible here immediately (verified). Reaching in with `docker exec` for this
+# was simply wrong — it cost ~200ms, needed a running box, and had to cope
+# with docker's own failure modes to learn something a local `git` already
+# knows. It costs nothing, so it always runs.
+check_branch() {
+    local wd="$1" want="$2" actual
+    [ -n "$want" ] || return 0
+    [ -d "$wd" ] || return 0        # already reported by check_workdir
+    if ! actual="$(git -C "$wd" branch --show-current 2>/dev/null)"; then
+        printf '%s' "not a readable git worktree any more"
+    elif [ -z "$actual" ]; then
+        printf '%s' "detached HEAD, not on a branch"
+    elif [ "$actual" != "$want" ]; then
+        printf '%s' "now on '$actual'"
+    fi
+}
+
 cmd_info() {
     require_docker
-    local name; name="$(resolve_instance "${1:-}")"
+    # Every check here is answered on the host, so there is nothing to opt out
+    # of. `net` used to need a docker exec because isolation lived inside the
+    # container; it is now a property of the network and cannot drift.
+    local pos=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                printf 'usage: boxy info [NAME]\n\n' >&2
+                printf '  Labels are shown, with any that no longer match\n' >&2
+                printf '  reality flagged beside them.\n' >&2
+                return 0 ;;
+            *) pos="$1"; shift ;;
+        esac
+    done
+    local name; name="$(resolve_instance "$pos")"
     inst_label_load "$name"
     local sdir; sdir="$(state_dir_for "$name")"
     local pubmap; pubmap="$(inst_label "$name" boxy.published)"
@@ -1154,8 +1271,32 @@ cmd_info() {
     printf 'user        %s\n' "$(inst_label "$name" boxy.user)"
     printf 'ssh         ssh -F %s %s\n' "$(ssh_config_path)" "$name"
     printf 'ssh port    %s\n' "$(inst_label "$name" boxy.ssh_port)"
-    printf 'workdir     %s -> /work\n' "$(inst_label "$name" boxy.workdir)"
-    printf 'net         %s\n' "$(inst_label "$name" boxy.net)"
+
+    local wd wtb wtr net user bad
+    wd="$(inst_label "$name" boxy.workdir)"
+    wtb="$(inst_label "$name" boxy.worktree_branch)"
+    wtr="$(inst_label "$name" boxy.worktree_repo)"
+    net="$(inst_label "$name" boxy.net)"
+
+    bad="$(check_workdir "$wd")"
+    printf 'workdir     %s -> /work' "$wd"
+    [ -n "$bad" ] && printf '   %s⚠ %s%s' "$C_RED" "$bad" "$C_OFF"
+    printf '\n'
+
+    if [ -n "$wtb" ]; then
+        bad="$(check_repo "$wtr")"
+        printf 'branch      %s in %s' "$wtb" "$wtr"
+        [ -n "$bad" ] && printf '   %s⚠ %s%s' "$C_RED" "$bad" "$C_OFF"
+        printf '\n'
+        bad="$(check_branch "$wd" "$wtb")"
+        [ -n "$bad" ] && printf '            %s⚠ %s%s\n' "$C_RED" "$bad" "$C_OFF"
+    fi
+
+    printf 'net         %s' "$net"
+    [ "$net" != "full" ] && printf '   %s(enforced by docker: %s is internal)%s' \
+        "$C_DIM" "boxy-iso-$name" "$C_OFF"
+    printf '\n'
+
     printf 'caps        %s\n' "$(inst_label "$name" boxy.caps)"
     printf 'state       %s\n' "$sdir"
     local pair
@@ -1170,7 +1311,7 @@ cmd_info() {
     fi
     printf 'forwardable %s   %s(boxy forward %s)\n' "$BOXY_PORTS" "$C_DIM$C_OFF" "$name"
     if [ "$(inst_label "$name" boxy.net)" = "limited" ]; then
-        printf 'proxy       boxy-proxy-%s (docker logs boxy-proxy-%s for denials)\n' "$name" "$name"
+        printf 'sidecar     boxy-sidecar-%s (docker logs boxy-sidecar-%s for denials)\n' "$name" "$name"
     fi
 }
 
@@ -1297,20 +1438,17 @@ cmd_stop() {
     require_docker
     local name; name="$(resolve_instance "${1:-}")"
     docker stop "$name" >/dev/null
-    docker stop "boxy-proxy-$name" >/dev/null 2>&1 || true
+    docker stop "boxy-sidecar-$name" >/dev/null 2>&1 || true
     ok "stopped $name"
 }
 
 cmd_start() {
     require_docker
     local name; name="$(resolve_instance "${1:-}")"
-    docker start "boxy-proxy-$name" >/dev/null 2>&1 || true
+    docker start "boxy-sidecar-$name" >/dev/null 2>&1 || true
     docker start "$name" >/dev/null
-    # A restart restores the default route, so isolation has to be reapplied
-    # every time — not just at create.
-    if [ "$(inst_label "$name" boxy.net)" != "full" ]; then
-        isolate_network "$name" || true
-    fi
+    # Nothing to reapply: isolation belongs to the network, not to the running
+    # container, so it is already in force before this returns.
     wait_for_ready "$name" || warn "$name started but is not answering SSH yet"
     ok "started $name (ssh port $(inst_label "$name" boxy.ssh_port))"
 }
@@ -1330,6 +1468,27 @@ cmd_logs() {
 # while the box existed. Your files are never touched: a -d directory is left
 # exactly as it was, and a scratch workdir is left in the OS temp area for the
 # OS to reap on its own schedule.
+# Retire a worktree checkout, and never the work in it.
+#
+# The branch always survives: it can hold the only copy of what you did, and
+# boxy is not the thing that decides that is finished. `git worktree remove`
+# without --force is the safety interlock — it refuses on uncommitted changes,
+# so a dirty tree is reported and left exactly where it is.
+rm_worktree() {
+    local repo="$1" branch="$2" path="$3"
+    if [ ! -d "$repo" ]; then
+        note "  repo $repo is gone; worktree left at $path"
+        return 0
+    fi
+    if git -C "$repo" worktree remove "$path" >/dev/null 2>&1; then
+        note "  worktree removed; branch $branch is still in $repo"
+    else
+        note "  worktree has uncommitted changes — left at $path"
+        note "  keep it, or discard it with:"
+        note "    git -C $repo worktree remove --force $path"
+    fi
+}
+
 cmd_rm() {
     require_docker
     local names=()
@@ -1350,16 +1509,18 @@ cmd_rm() {
     done
     [ "${#names[@]}" -gt 0 ] || die "rm: name required"
 
-    local name sdir workdir net
+    local name sdir workdir net wt_repo wt_branch
     for name in "${names[@]}"; do
         require_instance "$name"
         inst_label_load "$name"
         sdir="$(state_dir_for "$name")"
         workdir="$(inst_label "$name" boxy.workdir)"
         net="$(inst_label "$name" boxy.net)"
+        wt_repo="$(inst_label "$name" boxy.worktree_repo)"
+        wt_branch="$(inst_label "$name" boxy.worktree_branch)"
 
         docker rm -f "$name" >/dev/null 2>&1 || true
-        docker rm -f "boxy-proxy-$name" >/dev/null 2>&1 || true
+        docker rm -f "boxy-sidecar-$name" >/dev/null 2>&1 || true
         [ "$net" != "full" ] && remove_network_if_unused "boxy-iso-$name"
         remove_network_if_unused "boxy-egress"
 
@@ -1371,10 +1532,14 @@ cmd_rm() {
         ok "removed $name"
         # Tell them where the files are, since that is the only thing that
         # outlives the box and the only thing worth caring about.
-        case "$workdir" in
-            "$BOXY_WORKDIR_BASE"/*) note "  workdir left for the OS to reap: $workdir" ;;
-            *)                      note "  your directory is untouched: $workdir" ;;
-        esac
+        if [ -n "$wt_repo" ]; then
+            rm_worktree "$wt_repo" "$wt_branch" "$workdir"
+        else
+            case "$workdir" in
+                "$BOXY_WORKDIR_BASE"/*) note "  workdir left for the OS to reap: $workdir" ;;
+                *)                      note "  your directory is untouched: $workdir" ;;
+            esac
+        fi
     done
     write_ssh_config >/dev/null
 }
@@ -1382,11 +1547,9 @@ cmd_rm() {
 # ===========================================================================
 # monitoring
 # ===========================================================================
-# `boxy top` is the zero-infrastructure answer: a point-in-time read straight
-# from the daemon, no containers, no retention. It covers "what is running and
-# what is it using right now", which is most of what you want at a keyboard.
-# The Prometheus/Grafana stack below exists for the question this cannot
-# answer — "what happened while I was asleep".
+# A point-in-time read straight from the daemon: no containers, no retention,
+# nothing to run first. It answers "what is running and what is it using",
+# which is what you actually want at a keyboard.
 cmd_top() {
     require_docker
     local names watch=0
@@ -1406,29 +1569,21 @@ cmd_top() {
         $names
 }
 
-cmd_monitor() {
-    require_docker
-    local action="${1:-status}"
-    local compose="$SELF_DIR/monitoring/docker-compose.yml"
-    [ -f "$compose" ] || die "monitoring stack not found at $compose"
-    case "$action" in
-        up)
-            docker compose -f "$compose" up -d
-            ok "grafana at http://localhost:3001 (admin / admin on first login)"
-            ok "prometheus at http://localhost:9090"
-            ;;
-        down)   docker compose -f "$compose" down ;;
-        logs)   shift; docker compose -f "$compose" logs "$@" ;;
-        status) docker compose -f "$compose" ps ;;
-        *) die "monitor: expected up | down | status | logs" ;;
-    esac
-}
-
 # ===========================================================================
 # doctor / config
 # ===========================================================================
 cmd_doctor() {
-    local problems=0
+    local problems=0 verbose=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -v|--verbose) verbose=1; shift ;;
+            -h|--help)
+                printf 'usage: boxy doctor [--verbose]\n\n' >&2
+                printf '  -v, --verbose  also print `boxy info` for every box\n' >&2
+                return 0 ;;
+            *) die "doctor: unknown option $1" ;;
+        esac
+    done
     printf 'boxy %s\n\n' "$BOXY_VERSION"
 
     if command -v docker >/dev/null 2>&1; then
@@ -1458,13 +1613,6 @@ cmd_doctor() {
             "boxy keypair" "$C_YEL" "$C_OFF"
     fi
 
-    if [ -f "$BOXY_GIT_KEY" ]; then
-        printf '  %-24s %s\n' "git key" "$BOXY_GIT_KEY"
-    else
-        printf '  %-24s %snot found%s — boxes will lack git credentials\n' \
-            "git key" "$C_YEL" "$C_OFF"
-    fi
-
     if [ -f "$(wordlist_path)" ]; then
         printf '  %-24s %s words cached\n' "EFF wordlist" "$(wc -l < "$(wordlist_path)" | tr -d ' ')"
     else
@@ -1482,6 +1630,16 @@ cmd_doctor() {
         if [ "$orphans" -gt 0 ]; then
             printf '  %-24s %s%s%s (removed outside boxy; the next create clears them)\n' \
                 "orphaned state" "$C_YEL" "$orphans" "$C_OFF"
+        fi
+
+        # --verbose prints the full per-box report.
+        if [ "$verbose" = "1" ] && [ "$boxes" -gt 0 ]; then
+            local b
+            for b in $(list_instances); do
+                printf '\n  %s─── %s %s%s\n' "$C_DIM" "$b" \
+                    "$(printf '%.0s─' 1 2 3 4 5 6 7 8 9)" "$C_OFF"
+                cmd_info "$b" | sed 's/^/  /'
+            done
         fi
     fi
     printf '\n'
@@ -1502,13 +1660,11 @@ cmd_config() {
         "$( [ -f "$BOXY_CONFIG_FILE" ] || printf ' (not present; boxy config --init)' )"
     local k
     for k in BOXY_STATE_DIR BOXY_WORKDIR_BASE BOXY_IMAGE BOXY_PROXY_IMAGE BOXY_USER BOXY_SSH_KEY \
-             BOXY_GIT_KEY BOXY_SSH_PORT_BASE BOXY_PORTS \
-             BOXY_BIND_ADDR BOXY_NET BOXY_CAPS BOXY_RUNTIME BOXY_PASSWORD_WORDS BOXY_RESTART \
-             BOXY_SSH_HOST BOXY_CPUS BOXY_MEMORY; do
+             BOXY_SSH_PORT_BASE BOXY_PORTS \
+             BOXY_BIND_ADDR BOXY_NET BOXY_CAPS BOXY_PASSWORD_WORDS BOXY_RESTART \
+             BOXY_CPUS BOXY_MEMORY; do
         eval "printf '%-20s %s\n' $k \"\$$k\""
     done
-    printf '%-20s %s\n' BOXY_TS_AUTHKEY \
-        "$( [ -n "$BOXY_TS_AUTHKEY" ] && echo '(set)' || echo '(unset)' )"
     printf '%-20s %s\n' allowlist "$(allowlist_file)"
 }
 
@@ -1521,26 +1677,25 @@ boxy $BOXY_VERSION — disposable SSH-reachable dev boxes
 
 usage: boxy <command> [options]
 
-CORE — the reason boxy exists
+CORE — boxy functionality
   create [options]           create and start a box   (boxy create --help)
   ssh [NAME] [-- CMD]        interactive session, or one command
   forward [NAME] [PORTS]     tunnel box ports to the SAME localhost ports
   rm NAME...                 remove a box (never touches your files)
   ls                         list boxes
-  info [NAME]                one box in detail, including its port map
+  info [NAME]                one box in detail, checked against reality
   password [NAME]            print the stored sudo password
   ssh-config [--install]     emit/install an ssh_config covering every box
   build [--full]             build the images     (boxy build --help)
-  doctor                     check the local setup
+  doctor [--verbose]         check the local setup; -v adds info per box
   config [--init]            show or scaffold configuration
 
-DOCKER PASSTHROUGH — thin wrappers that resolve the name and add boxy's
-defaults, then hand off. Equivalent plain-docker command in brackets.
+DOCKER PASSTHROUGH — wrappers that resolve the container name, add boxy's
+defaults, then hand off. [Equivalent docker command in brackets].
   exec [NAME] [CMD]          [docker exec]    a way in that does not use ssh
   logs [NAME] [-f]           [docker logs]    the box's entrypoint narration
   start|stop|restart [NAME]  [docker start…]  lifecycle
   top [--watch]              [docker stats]   live CPU/memory per box
-  monitor up|down|status     [docker compose] optional prometheus + grafana
 
 The name may be omitted whenever exactly one box exists.
 EOF
@@ -1567,7 +1722,6 @@ main() {
         logs)        cmd_logs "$@" ;;
         rm|destroy)  cmd_rm "$@" ;;
         top|stats)   cmd_top "$@" ;;
-        monitor)     cmd_monitor "$@" ;;
         doctor)      cmd_doctor "$@" ;;
         config)      cmd_config "$@" ;;
         -v|--version) printf 'boxy %s\n' "$BOXY_VERSION" ;;

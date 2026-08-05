@@ -6,11 +6,12 @@ known SSH keypair, a mounted working directory, published ports, and an
 optional egress allowlist.
 
 ```
-$ boxy create -d ~/code/experiment
+$ cd ~/code/experiment && boxy create .
 created instance 1 (boxy-1), ssh at port 2200
 
-$ boxy create -r git@github.com:you/repo.git
+$ boxy create worktree
 created instance 2 (boxy-2), ssh at port 2201
+  branch  boxy/boxy-2   (shares history with /Users/you/code/experiment)
 
 $ boxy ssh boxy-2
 boxyboy@boxy-2:/work$
@@ -23,13 +24,13 @@ boxyboy@boxy-2:/work$
 ```bash
 ./boxy build          # builds boxy:latest and boxy-proxy:latest (~7 min, 2.3 GB)
 ./boxy config --init  # writes ~/.config/boxy/config and the egress allowlist
-./boxy create -d .    # mount the current directory at /work
+./boxy create .       # mount the current directory at /work
 ./boxy ls
 ./boxy ssh boxy-1
 ```
 
 Put `boxy` on your `PATH` (a symlink is fine — it resolves its own directory
-to find the `Dockerfile` and `monitoring/` alongside it):
+to find the `Dockerfile` and `docker/` directory alongside it):
 
 ```bash
 ln -s "$PWD/boxy" /usr/local/bin/boxy
@@ -45,8 +46,8 @@ ln -s "$PWD/boxy" /usr/local/bin/boxy
    <state>/boxy_ed25519.pub ──env─────────▶  ~boxyboy/.ssh/authorized_keys
    password (plaintext, 0600) ─┐
                                └─hash──────▶  chpasswd -e     (sudo only)
-   ~/.ssh/id_ed25519 ─────ro mount────────▶  ~boxyboy/.ssh/git_key
    <workdir or $TMPDIR/boxy/…> ──mount────▶  /work
+   <repo>/.git  (worktree boxes only) ────▶  <repo>/.git   (same path)
    <state>/hostkeys ──────mount───────────▶  /etc/ssh/hostkeys
    127.0.0.1:2200 ────────publish─────────▶  :22  (sshd, key-only)
    127.0.0.1:<yours> ─────publish─────────▶  only what you pass to -p
@@ -54,7 +55,7 @@ ln -s "$PWD/boxy" /usr/local/bin/boxy
 
 Three things are worth calling out because they drive most of the design:
 
-**Nothing is baked into the image.** Keys, password hashes, repo URLs, proxy
+**Nothing is baked into the image.** Keys, password hashes, proxy
 settings and UID/GID all arrive as environment at `docker run` and are applied
 by `docker/entrypoint.sh`. One image serves every box; rotating your keypair
 does not mean a rebuild, and `docker history` reveals nothing.
@@ -83,11 +84,11 @@ no `StrictHostKeyChecking=no`.
 | `boxy forward [NAME] [PORTS]` | Tunnel box ports to the *same* localhost numbers |
 | `boxy rm NAME...` | Remove a box — never touches your files |
 | `boxy ls` | List boxes with status, SSH port, net mode, workdir |
-| `boxy info [NAME]` | One box in detail, including its port map |
+| `boxy info [NAME]` | One box in detail, checked against reality |
 | `boxy password [NAME]` | Print the stored sudo password |
 | `boxy ssh-config [--install]` | Emit / install an `ssh_config` covering every box |
 | `boxy build [--full]` | Build the images |
-| `boxy doctor` | Check the local setup, box count, and orphaned state |
+| `boxy doctor [--verbose]` | Check the local setup; `-v` adds `boxy info` per box |
 | `boxy config [--init]` | Show or scaffold configuration |
 
 **Docker passthroughs** — thin wrappers that resolve the box name, add boxy's
@@ -100,33 +101,37 @@ container name *is* the box name.
 | `boxy logs [NAME] [-f]` | `docker logs` | The entrypoint's setup narration — the first place to look when a box misbehaves |
 | `boxy start\|stop\|restart` | `docker start/stop` | Re-applies egress isolation and re-pins the host key on the way back up |
 | `boxy top [--watch]` | `docker stats` | Filters to boxy-managed containers |
-| `boxy monitor up\|down` | `docker compose` | Points at the bundled monitoring stack |
 
 The name may be omitted whenever exactly one box exists. Proxy sidecars don't
 count toward that — a single `--net limited` box still lets you omit it.
 
 ### `boxy create`
 
+One positional argument says what lands in `/work`:
+
+| | |
+| --- | --- |
+| `boxy create .` | mount this directory |
+| `boxy create ~/src/thing` | mount that directory |
+| `boxy create worktree` | a new git worktree of the repo you are standing in |
+| `boxy create` | a fresh scratch dir under `$TMPDIR/boxy` |
+
+`worktree` is a keyword. If you have a directory actually named `worktree`,
+write `./worktree`.
+
 ```
--d, --dir DIR         mount DIR at /work (default: fresh scratch dir in $TMPDIR)
--r, --repo URL        clone URL into /work on first boot
--b, --ref REF         branch/tag to clone
+-b, --ref REF         commit-ish the worktree branches from (default: HEAD)
 -n, --name NAME       instance name (default: boxy-N)
     --password PASS   sudo password (default: random EFF passphrase)
     --words N         words in the generated passphrase (default: 4)
 -u, --user NAME       login user (default: boxyboy)
 -k, --key PATH        public key to authorize (default: $BOXY_SSH_KEY.pub)
-    --git-key PATH    private key mounted for git (default: ~/.ssh/id_ed25519)
-    --no-git-key      withhold git credentials
     --net MODE        full | none | limited   (default: full)
     --caps MODE       minimal | default capability set (default: minimal)
-    --runtime NAME    OCI runtime, e.g. runsc  (default: the daemon's)
     --allow DOMAIN    extra allowed domain for --net limited (repeatable)
 -p, --publish SPEC    publish a port: PORT or HOSTPORT:PORT (repeatable)
 -v, --volume SRC:DST  extra bind mount (repeatable)
 -e, --env K=V         extra environment variable (repeatable)
-    --tailscale       join the tailnet (needs BOXY_TS_AUTHKEY)
-    --ts-hostname H   tailnet hostname (default: instance name)
     --image IMG       image to run
     --cpus N          CPU limit
     --memory SIZE     memory limit, e.g. 8g
@@ -137,14 +142,15 @@ count toward that — a single `--net limited` box still lets you omit it.
 ## The working directory
 
 ```bash
-boxy create -d ~/code/thing    # mount a directory you own
-boxy create                    # fresh scratch dir in $TMPDIR/boxy/
+boxy create .              # mount a directory you own
+boxy create worktree       # a fresh branch of the repo you are in
+boxy create                # fresh scratch dir in $TMPDIR/boxy/
 ```
 
-With `-d`, that directory is mounted at `/work` as-is. boxy never creates it,
-never moves it, and never deletes it.
+Given a path, that directory is mounted at `/work` as-is. boxy never creates
+it, never moves it, and never deletes it.
 
-Without `-d`, boxy makes a fresh scratch directory under
+Given nothing, boxy makes a fresh scratch directory under
 `$TMPDIR/boxy/<name>.XXXXXX` (`mktemp`, so a recreated box never inherits a
 previous one's leftovers) and then **stops caring about it**. The OS reaps
 temp directories on its own schedule; boxy does not track, garbage-collect, or
@@ -171,100 +177,138 @@ them.
 
 ---
 
-## Ports
-
-**Nothing but SSH is published by default.** Instance *N* gets SSH on
-`2200 + N - 1`, and that is the only automatic host binding.
-
-Everything else is one of two explicit mechanisms, both of which state their
-mapping rather than making you infer it:
-
-### `boxy forward` — same number on both sides
+## Worktree boxes
 
 ```bash
-boxy forward boxy-1              # tunnels the whole BOXY_PORTS set
-boxy forward boxy-1 2718         # just marimo
-boxy forward boxy-1 --bg         # background; --stop to end
+$ cd ~/code/thing
+$ boxy create worktree
+  workdir /var/folders/…/T/boxy/boxy-1.k3Xq2v -> /work
+  branch  boxy/boxy-1   (shares history with /Users/you/code/thing)
 ```
 
-`-L 2718:127.0.0.1:2718`, so a marimo server on `:2718` in the box is on
-`:2718` here. Nothing to decode. Only one box can own a given localhost port
-at a time, which is the right semantics: forward the box you're working in.
-This is the default path and needs no decision at create time.
-
-### `-p` — published, docker-style
+The box gets a real git worktree on its own branch, checked out from `HEAD`
+(or from `--ref`). Commit inside the box and the commit is in your repository
+immediately — same objects, same refs, nothing to push or pull:
 
 ```bash
-boxy create -p 2718              # localhost:2718 -> container 2718
-boxy create -p 12718:2718        # localhost:12718 -> container 2718
+$ boxy ssh boxy-1 -- 'cd /work && git commit -am wip'
+$ git log --oneline boxy/boxy-1     # on the host, right away
 ```
 
-Exactly docker's `-p` semantics. A bare port means the same number on both
-sides; `HOST:CONTAINER` states it explicitly. If the host port is taken you
-get an error before anything is created, not a silent remap. `boxy info`
-always prints the resulting table.
+**How.** A worktree's `.git` is a *file* holding an absolute path back to the
+main repository's git directory. Mount only the worktree and the box has a
+broken repo, so boxy also mounts that git directory at the identical path
+inside the container. Your main checkout is not mounted — the box shares
+history and nothing else, and cannot touch your working tree.
 
-Use this when you want a binding that outlives a tunnel — a long-running
-service, or a box on a VPS reached over tailscale.
+**No credentials are involved.** The box commits locally against a mounted
+object store. It holds no SSH key, so it can push nowhere; pushing is something
+you do from the host afterwards. This is why boxy has no git-key handling at
+all.
 
-> Servers must bind `0.0.0.0` inside the box to be reachable through a
-> **published** port — `marimo edit --host 0.0.0.0`, `jupyter lab --ip 0.0.0.0`.
-> Binding `127.0.0.1` is fine over `boxy forward`, since the tunnel terminates
-> inside the container's own loopback.
+**`boxy rm` keeps your work.** It runs `git worktree remove`, which refuses on
+uncommitted changes — a dirty tree is reported and left alone:
 
-Published ports bind to `127.0.0.1` by default (`BOXY_BIND_ADDR`). On a VPS,
-leave it that way and reach boxes over tailscale.
+```bash
+$ boxy rm boxy-1
+removed boxy-1
+  worktree has uncommitted changes — left at /var/folders/…/boxy-1.k3Xq2v
+  keep it, or discard it with:
+    git -C /Users/you/code/thing worktree remove --force /var/folders/…/boxy-1.k3Xq2v
+```
+
+The branch always survives `boxy rm`; it may hold the only copy of the work.
+Because branches persist and instance names get reused, a second `boxy/boxy-1`
+becomes `boxy/boxy-1-2`.
 
 ---
+
+## Labels vs reality
+
+Docker labels are boxy's state store, and a label records **what you asked for
+at create time**. Most cannot subsequently be wrong: `ssh port` and `published`
+agree with `docker port` by construction, `user`/`caps`/`created` are fixed for
+the life of the container, and `net` is a property of the box's network that
+Docker enforces. Three can drift, and all three are checked on every `boxy
+info`:
+
+| | Drifts when |
+| --- | --- |
+| `workdir` | you delete or move the directory — `/work` silently becomes an empty mount |
+| `branch` repo | you move the repository |
+| `branch` | you rename it, or the box checks out another |
+
+```bash
+$ boxy info web
+workdir     /var/folders/…/web.k3Xq2v -> /work   ⚠ MISSING on the host
+branch      boxy/web in /Users/you/code/thing
+            ⚠ now on 'renamed-behind-boxy'
+net         none   (enforced by docker: boxy-iso-web is internal)
+```
+
+**Reality is printed beside the label, never instead of it.** The label is what
+you asked for and the divergence is the news; quietly rewriting one to match
+the other would erase the thing worth reporting.
+
+All three are answered entirely on the host — `/work` and the git dir are bind
+mounts, so the host and the box read the same bytes. A `git checkout` performed
+*inside* the box shows up here, and the checks work on a stopped box. Nothing
+enters the container, so there is no flag to opt out of, no cost worth
+measuring, and nothing a box could lie about.
+
+> An earlier design checked `net` by running `ip route` inside the box. That is
+> gone, and worth recording why: the box owns every binary such a check could
+> run, so a box with `sudo` could shadow `ip` and report clean while egress
+> worked — demonstrated, not theoretical. Isolation is now a property of the
+> network instead of the container, so there is no longer anything to ask the
+> box about.
 
 ## Controlling internet access
 
 ```bash
 boxy create --net full      # default: ordinary bridge, unrestricted
-boxy create --net none      # no default route — nothing off the host
-boxy create --net limited   # no default route + an allowlisting proxy sidecar
+boxy create --net none      # sealed: nothing in or out except through the sidecar
+boxy create --net limited   # sealed + an allowlisting proxy
 ```
 
-Both restricted modes work by **deleting the box's default route** — not by
-using `docker network create --internal`. An internal network does block
-egress, but it also drops the inbound traffic published ports depend on, which
-would leave the box unreachable over SSH and defeat the whole premise. With
-only the default route removed, on-link traffic still flows: replies to
-published ports reach the host, and a sidecar on the same subnet is still
-reachable, while anything needing a gateway goes nowhere.
+Both restricted modes put the box **alone on a `docker network create
+--internal` network**. That is the whole of the isolation, and Docker enforces
+it: no default route is installed, no NAT rule exists for the subnet, and
+external DNS resolution is dead. Nothing is applied to the running container,
+so there is no state to lose — isolation survives a restart, a daemon restart,
+or anything else that happens without boxy's involvement.
 
-The route is removed from the *host* via `docker exec --privileged`, which
-grants privileges to that one exec'd process. The container itself never holds
-`CAP_NET_ADMIN`, so although the box user has `sudo`, restoring the route from
-inside fails:
+Root inside the box cannot undo it, because `CAP_NET_ADMIN` is never granted:
 
 ```
-$ sudo ip route add default via 172.30.0.1
+$ sudo ip link add dummy0 type dummy
 RTNETLINK answers: Operation not permitted
 ```
 
-`limited` additionally starts a per-box tinyproxy sidecar attached to both the
-box's subnet and a normal bridge, making it the single path out. It refuses
-any domain not in `~/.config/boxy/allowlist.txt`.
+### The sidecar
 
-Two things route removal does *not* cover, both closed separately:
+An internal network has one consequence: **Docker will not create a host port
+binding for a container whose only network is internal.** `-p` is accepted and
+silently discarded, and `docker port` reports nothing. So the box publishes
+nothing itself, and a per-box sidecar — the only container on both the box's
+network and an ordinary bridge — carries traffic in both directions:
 
-**DNS.** Docker's embedded resolver forwards through the daemon, outside the
-container's netns, so an unrouted box could still resolve arbitrary names —
-a covert channel in both directions (data out in query labels, back in TXT
-records). Isolated boxes get `--dns 127.0.0.1`, killing external resolution
-while leaving container-name lookups intact.
+- **ingress**: `socat` listeners that hold the box's published ports, including
+  SSH. This is what keeps `boxy ssh`, `boxy forward`, `scp` and `-p` working on
+  a sealed box.
+- **egress** (`--net limited` only): tinyproxy, refusing any domain not in
+  `~/.config/boxy/allowlist.txt`.
 
-**The gateway itself.** It is on-link, so it stays reachable without a default
-route — and on a Linux VPS that is the host, running sshd and whatever else.
-An `OUTPUT` firewall closes it: loopback and `ESTABLISHED,RELATED` are
-allowed (so inbound SSH replies still work), plus the proxy's `/32` under
-`--net limited`. The rules are installed by privileged exec too, so
-`sudo iptables` inside the box fails exactly like `sudo ip route` does.
+**The sidecar is not a way into the box.** Traffic only ever flows host →
+sidecar → box, so the sidecar never needs to accept a connection *from* the
+box. Its listeners bind to its outward address alone and the private side is
+left bare. From inside a box, every port on the sidecar is closed — by IP and
+by name — and it cannot be used as a router even when handed an explicit
+default route pointing at it. It runs with `--cap-drop=ALL` and
+`net.ipv4.ip_forward=0`, so it has nothing to escalate to and cannot forward.
 
-Isolation is reapplied on every `boxy start`/`restart`, since a restart
-rebuilds the network namespace and keeps neither the route change nor the
-firewall.
+Under `--net limited` the box *does* reach the proxy port, necessarily — that
+is what `limited` means, and it is the one listener exposed to the box.
 
 The entrypoint exports `HTTP_PROXY`/`HTTPS_PROXY` (into `/etc/environment`, so
 even non-interactive SSH commands see them), points `git`'s HTTP transport at
@@ -272,8 +316,8 @@ the proxy, and installs a `ProxyCommand` so `git@github.com` still works over
 a CONNECT tunnel.
 
 ```bash
-boxy create -r git@github.com:you/repo.git --net limited --allow example.com
-docker logs boxy-proxy-boxy-1     # every denial is logged here
+boxy create worktree --net limited --allow example.com
+docker logs boxy-sidecar-boxy-1     # every denial is logged here
 #   NOTICE  Proxying refused on filtered domain "example.com"
 ```
 
@@ -329,67 +373,6 @@ work from *inside* the box against the mounted volume when that suits better.
 
 ---
 
-## Tailscale and a VPS
-
-Pass `--tailscale` and the box joins your tailnet under its own hostname:
-
-```bash
-export BOXY_TS_AUTHKEY='tskey-auth-...'   # reusable + ephemeral
-boxy create -d ~/code/thing --tailscale
-ssh boxyboy@boxy-1                        # via MagicDNS, from anywhere
-```
-
-`tailscaled` runs in **userspace-networking** mode, so the box needs no
-`/dev/net/tun` and no `NET_ADMIN` capability — it stays an ordinary
-unprivileged container. Inbound tailnet connections are proxied to localhost
-services, which is enough for sshd on :22.
-
-Use *ephemeral* auth keys: nodes vanish from the tailnet when a box is
-destroyed rather than piling up as dead entries.
-
-To drive a remote VPS, point the Docker CLI at it over SSH — boxy needs no
-changes, since it only ever talks to `docker`:
-
-```bash
-docker context create vps --docker "host=ssh://you@vps.example.com"
-docker context use vps
-boxy create -r git@github.com:you/repo.git --tailscale --net limited
-```
-
-Set `BOXY_SSH_HOST` to the VPS's tailnet name so generated `ssh_config`
-entries point somewhere useful, and keep `BOXY_BIND_ADDR=127.0.0.1`.
-
----
-
-## Monitoring
-
-Two tiers. `boxy top` reads straight from the Docker daemon — no extra
-services, no retention — and answers "what is running and what is it using".
-The stack below is opt-in and exists for the question `top` cannot answer:
-what happened while you were not looking.
-
-```bash
-boxy top
-boxy top --watch
-```
-
-```bash
-boxy monitor up      # Grafana → http://localhost:3001  (admin/admin)
-boxy monitor status
-boxy monitor down
-```
-
-cAdvisor reads the cgroup tree, so it discovers every boxy container
-automatically — nothing is installed inside a box, which is the point when the
-boxes are disposable. node-exporter covers host headroom. The provisioned
-"boxy — instances" dashboard shows per-box CPU, memory and network alongside
-host CPU/memory/disk.
-
-Both Grafana and Prometheus bind to loopback. On a VPS, reach them over
-tailscale and change the Grafana password (`GF_ADMIN_PASSWORD`).
-
----
-
 ## Container privileges
 
 Two knobs, both aimed at the VPS rather than your laptop.
@@ -424,31 +407,6 @@ That's the fastest way to confirm or rule out capabilities as the cause. You
 can also add a single capability via `BOXY_MINIMAL_CAPS` instead of abandoning
 the reduced set.
 
-### `--runtime` (gVisor)
-
-```bash
-boxy create --runtime runsc         # or BOXY_RUNTIME=runsc in the config
-```
-
-gVisor is a user-space kernel: it reimplements the Linux syscall interface in
-a Go process, so a kernel exploit from inside the box hits that
-reimplementation rather than the host kernel. Escaping needs a bug in gVisor
-*and* a second one to clear its own seccomp jail.
-
-Worth it on a **Linux VPS**, where the container kernel is the host kernel.
-Not worth it on **Docker Desktop**, where containers already run inside a VM —
-check for yourself:
-
-```bash
-$ docker run --rm boxy:latest uname -r
-6.12.76-linuxkit          # the VM's kernel, not Darwin
-```
-
-An escape there lands you in a disposable Linux VM, not on macOS. gVisor isn't
-bundled with Docker and isn't present in Docker Desktop's VM, so the setting is
-inert until you install `runsc` on the host and register it in
-`/etc/docker/daemon.json`. Costs 10–50% on syscall- and IO-heavy work.
-
 ---
 
 ## Configuration
@@ -462,13 +420,10 @@ Most-used knobs:
 | Variable | Default | |
 | --- | --- | --- |
 | `BOXY_SSH_KEY` | `<state>/boxy_ed25519` | keypair authorized on every box |
-| `BOXY_GIT_KEY` | `~/.ssh/id_ed25519` | key mounted for git |
 | `BOXY_USER` | `boxyboy` | login user |
 | `BOXY_PORTS` | `2718 8888 8000 8080 3000 5000 6006` | what `boxy forward` tunnels |
 | `BOXY_BIND_ADDR` | `127.0.0.1` | interface for published ports |
 | `BOXY_NET` | `full` | default egress policy |
-| `BOXY_SSH_HOST` | `127.0.0.1` | host in generated ssh_config |
-| `BOXY_TS_AUTHKEY` | *(unset)* | tailscale auth key |
 
 ---
 
@@ -481,7 +436,7 @@ Default build — the stack you actually work in:
 
 `numpy` · `scipy` · `pandas` · `matplotlib-base` · `jax[cpu]` · `marimo` ·
 `ipython` · `uv` · `mamba`/`conda` · `nodejs` · `git` · `git-lfs` · `tmux` ·
-`ripgrep` · `fd` · `jq` · `htop` · `build-essential` · `tailscale`
+`ripgrep` · `fd` · `jq` · `htop` · `build-essential`
 
 Opt-in, because they are large and not everyone wants them in every box:
 
@@ -519,30 +474,25 @@ CPU-only; for GPU you would add a CUDA build target and `jax[cuda12]`.
 - The box user has `sudo` **inside the container**. A container root is not a
   host root, but it is not a hard boundary either — do not run code you
   actively distrust in a box and assume the host is safe.
-- `BOXY_GIT_KEY` is mounted read-only and copied to a `0400` file owned by the
-  box user. The box user can read it — that is unavoidable if you want to push
-  from inside. Use `--no-git-key`, or a dedicated deploy key, when that is not
-  a trade you want.
-- `--net none` and `--net limited` hold up against the box user, on three
-  separate fronts. The default route is removed from outside the container;
-  `CAP_NET_ADMIN` is never granted, so neither `sudo ip route add default` nor
-  `sudo iptables` works from inside; and an `OUTPUT` firewall denies the
-  on-link surface that route removal alone leaves open.
-- **DNS is deliberately dead in an isolated box.** Docker's embedded resolver
-  forwards queries through the daemon, which lives outside the container's
-  network namespace — so removing the route does not touch it, and a box with
-  no route to anywhere could still resolve arbitrary names. That is a
-  bidirectional covert channel: data out in query labels, data back in TXT
-  records. Isolated boxes get `--dns 127.0.0.1`, where nothing listens.
-  Container-name resolution still works, which is all a box needs to find its
-  proxy, and a proxied client hands the hostname to the proxy to resolve.
-- **The gateway is firewalled, not just unrouted.** Deleting the default route
-  only stops traffic that needs a gateway; the gateway address itself is
-  on-link, so an isolated box could otherwise reach anything in the host's
-  network namespace — on a VPS that means sshd, a TCP-exposed Docker API, or
-  Grafana. The rules allow loopback and `ESTABLISHED,RELATED` (so replies to
-  inbound SSH keep flowing) plus, under `--net limited`, the proxy's exact
-  `/32`. Everything else is dropped.
+- No git credentials ever enter a box. A worktree box shares your repository's
+  object store, so it can commit; it holds no key and can push nowhere.
+- `--net none` and `--net limited` hold up against the box user because the
+  isolation is not in the container at all: the box's network is created
+  `--internal`, so Docker installs no route and no NAT for it. There is
+  nothing inside to switch off, and `CAP_NET_ADMIN` is never granted, so
+  `sudo ip link add` fails.
+- **DNS is dead in an isolated box**, without boxy doing anything: an
+  internal network resolves no external name, closing what would otherwise be
+  a bidirectional covert channel (data out in query labels, back in TXT
+  records). Container-name lookups still work, which is how the sidecar finds
+  the box.
+- **The sidecar is not reachable from the box.** It is dual-homed, so it would
+  be the obvious thing to attack — but traffic only flows host → sidecar →
+  box, so its listeners bind to its outward address and the private side is
+  bare. Verified from inside a box: every port closed by IP and by name, and
+  no egress even when given a default route pointing at it. It holds no
+  capabilities (`--cap-drop=ALL`) and has `ip_forward=0`, so it cannot be
+  turned into a router.
 - Boxes cannot reach each other: each isolated box gets its own subnet with no
   route between them.
 - **What an isolated box cannot do:** reach the internet, reach the host, or
@@ -551,9 +501,9 @@ CPU-only; for GPU you would add a CUDA build target and `jax[cuda12]`.
   gap in the implementation, it is the shape of the tool. Concretely:
   - Your `-d` directory is mounted read-write. Code in the box can read,
     modify or encrypt it.
-  - `BOXY_GIT_KEY`, unless you pass `--no-git-key`, is readable by the box
-    user — and `github.com` is on the default allowlist. Steal the key, push.
-    No container escape required.
+  - A worktree box has your repository's git dir mounted read-write. Code in
+    the box can rewrite branches and delete objects in your real repo. It has
+    no credentials, so it cannot reach a remote — the blast radius is local.
   - Under `--net limited`, the allowlist constrains *where* you can talk, not
     *what* you can say. A `POST` from inside a limited box reaches
     `api.github.com` and gets a real response. Any allowlisted host that
@@ -562,54 +512,57 @@ CPU-only; for GPU you would add a CUDA build target and `jax[cuda12]`.
   everything above at once — namespaces, cgroups, seccomp and capabilities are
   all enforced by the thing that just got compromised. On Docker Desktop this
   matters less than it sounds: containers run against the VM's kernel, so an
-  escape lands in a disposable Linux VM, not on macOS. On a Linux VPS the
-  container kernel *is* the host kernel, which is where `BOXY_RUNTIME=runsc`
-  (gVisor) earns its keep.
+  escape lands in a disposable Linux VM, not on macOS.
 - Capabilities are reduced by default (`BOXY_CAPS=minimal`, 10 of Docker's 14)
   but tuned for usability over provable minimality — see the config file for
   which are kept and why.
-- All of it is reapplied on every `boxy start`/`restart`, because a restart
-  rebuilds the network namespace and neither the route change nor the firewall
-  survives it.
-- `BOXY_GIT_KEY` is mounted read-only and copied to a `0400` file owned by the
-  box user. The box user can read it — that is unavoidable if you want to push
-  from inside. Use `--no-git-key`, or a dedicated deploy key, when that is not
-  a trade you want.
-- `--net none` and `--net limited` hold up against the box user: the default
-  route is removed from outside and `CAP_NET_ADMIN` is never granted to the
-  container, so `sudo ip route add default` inside the box fails. What they do
-  not defend against is a container escape, and DNS still resolves through
-  Docker's embedded resolver (no data path, but names do leak). Treat them as
-  a strong guardrail — good enough to stop a dependency phoning home — rather
-  than a sandbox for hostile code.
-- There is a sub-second window at `create` between the container starting and
-  the route being removed. The entrypoint blocks on a host-set marker before
-  cloning, so no repo fetch happens in that window.
+- **Nothing has to be reapplied.** Isolation belongs to the network, not to
+  the running container, so a restart — by you, by the daemon, or by anything
+  else — cannot lose it. An earlier design removed the default route at
+  runtime and *did* silently un-isolate a box on restart; that class of bug no
+  longer exists. `BOXY_RESTART` still defaults to `no`, now purely so a box
+  you forgot to remove does not come back on its own.
+- No git credentials ever enter a box. A worktree box shares your repository's
+  object store, so it can commit; it holds no key and can push nowhere.
+- `--net none` and `--net limited` hold up against the box user: the network
+  is internal and `CAP_NET_ADMIN` is never granted. What they do not defend
+  against is a container escape. Treat them as a strong guardrail — good
+  enough to stop a dependency phoning home — rather than a sandbox for
+  hostile code.
+- There is no startup window. The old design had one — a gap between the
+  container starting and the route being deleted, papered over with a
+  host-set marker the entrypoint had to wait on. An internal network is in
+  force before the container's first instruction runs, so both the gap and
+  the handshake are gone.
 
 ---
 
 ## Troubleshooting
 
-**`boxy doctor`** first — it checks the daemon, images, keys and wordlist cache.
+**`boxy doctor`** first — it checks the daemon, images, keys and wordlist
+cache, and flags any isolated box that has lost its isolation. Add
+`--verbose` for a full `boxy info` on every box.
 
 **Box created but SSH times out.** Read `boxy logs <name>`; the entrypoint
 narrates every step. Then `boxy exec <name>`, which uses `docker exec` and
 does not depend on SSH at all.
 
 **A `--net limited` box can't reach something it should.** `docker logs
-boxy-proxy-<name>` names every refused domain. Add it to
+boxy-sidecar-<name>` names every refused domain. Add it to
 `~/.config/boxy/allowlist.txt` (applies to boxes created afterwards) or pass
 `--allow` on the next `create`. Remember that a blocked HTTPS request looks
 like a timeout/`000`, not a 403.
 
-**`boxy create` warns that egress is NOT restricted.** The privileged exec
-that removes the default route failed. The box is up and usable but has full
-internet; `docker exec --privileged <name> ip route del default` reproduces
-the failure with a real error message.
+**An isolated box is unreachable over SSH.** Its ports live on the sidecar,
+so check that one first: `docker logs boxy-sidecar-<name>` should report the
+listeners it placed. If it exited, the box itself is fine and still reachable
+with `boxy exec <name>`.
 
 **Permission errors on a mounted volume (Linux hosts).** boxy passes your
 host UID/GID and the entrypoint remaps the box user to match. If you mounted a
 tree owned by someone else, that will not help; `chown` it or mount elsewhere.
 
-**Clone failed.** The box still starts — deliberately, so you can SSH in and
-find out why. Check that `BOXY_GIT_KEY` exists and is authorized on the remote.
+**`git` in a worktree box says "not a git repository".** The box needs the
+shared git dir mounted at the same absolute path the worktree's `.git` file
+names. `boxy info NAME` shows the branch and repo; check that the repo still
+exists at that path and was not moved after the box was created.

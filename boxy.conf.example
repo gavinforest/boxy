@@ -13,11 +13,6 @@
 # one you would rather use.
 #BOXY_SSH_KEY="$BOXY_STATE_DIR/boxy_ed25519"
 
-# Private key bind-mounted read-only into each box so git can reach GitHub.
-# The box user can read it — that is the price of being able to push from
-# inside. Set to "" (or pass --no-git-key) to withhold it.
-#BOXY_GIT_KEY="$HOME/.ssh/id_ed25519"
-
 # Login user inside the box.
 #BOXY_USER=boxyboy
 
@@ -36,13 +31,9 @@
 # 2718 marimo · 8888 jupyter · 8000/8080 http · 3000 node · 5000 flask · 6006 tensorboard
 #BOXY_PORTS="2718 8888 8000 8080 3000 5000 6006"
 
-# Interface published ports bind to. Loopback by default — on a VPS you should
-# reach boxes over tailscale, not by exposing SSH to the internet. Setting this
-# to 0.0.0.0 puts every box's SSH port on the public interface.
+# Interface published ports bind to. Loopback by default. Setting this to
+# 0.0.0.0 puts every box's SSH port on every interface on this machine.
 #BOXY_BIND_ADDR=127.0.0.1
-
-# Host that generated ssh_config entries point at.
-#BOXY_SSH_HOST=127.0.0.1
 
 # Default egress policy: full | none | limited
 #BOXY_NET=full
@@ -80,34 +71,25 @@
 # `default` if you find one specific thing you need.
 #BOXY_MINIMAL_CAPS="CHOWN DAC_OVERRIDE FOWNER KILL SETGID SETUID SYS_CHROOT NET_BIND_SERVICE NET_RAW AUDIT_WRITE"
 
-# OCI runtime. Empty means the daemon's default (runc).
-#
-# Set to `runsc` on a host where gVisor is installed. gVisor is a user-space
-# kernel: it reimplements the Linux syscall interface in a Go process, so a
-# kernel exploit from inside the box hits that reimplementation instead of the
-# host kernel. Worth doing on a Linux VPS, where the container kernel IS the
-# host kernel. Pointless on Docker Desktop, where containers already run inside
-# a VM and an escape lands you in a disposable Linux VM rather than on macOS.
-# Costs: 10-50% on syscall/IO-heavy work, and some syscalls are unimplemented.
-#BOXY_RUNTIME=
-
 # --- passwords ------------------------------------------------------------
 
 # Words drawn from the EFF long (7776-word) list. 4 words is ~51.7 bits.
 #BOXY_PASSWORD_WORDS=4
 
 # --- resources ------------------------------------------------------------
-#BOXY_RESTART=unless-stopped
+
+# Whether a box comes back on its own after the Docker daemon restarts.
+#
+# Leave this alone unless you know you want it. Egress isolation is applied
+# from outside the container and does not survive a restart, and a daemon-
+# driven restart does not go through boxy — so a `--net none` box set to
+# `unless-stopped` returns fully connected while still labelled isolated.
+# `boxy start` re-applies isolation, so starting a box yourself is safe, and
+# `boxy doctor` reports any box that has drifted.
+#BOXY_RESTART=no
+
 #BOXY_CPUS=
 #BOXY_MEMORY=
-
-# --- tailscale ------------------------------------------------------------
-
-# Reusable, ephemeral, pre-authorized auth key from the Tailscale admin
-# console. Ephemeral keys are the right kind here: nodes disappear from the
-# tailnet when a box is destroyed instead of accumulating as dead entries.
-# Prefer exporting this from a secret store over writing it here.
-#BOXY_TS_AUTHKEY="tskey-auth-..."
 
 # --- paths ----------------------------------------------------------------
 
@@ -115,8 +97,8 @@
 # only while a box does; `boxy rm` deletes a box's entry.
 #BOXY_STATE_DIR="$HOME/.local/share/boxy"
 
-# Where a box's workdir goes when you don't pass -d. Scratch space belongs in
+# Where a box's workdir goes when you name no target. Scratch space belongs in
 # the OS temp area: boxy creates a fresh directory per box and then leaves it
 # alone, so the OS reaps it on its own schedule and there is no lifecycle to
-# think about. A directory you pass with -d is yours and is never touched.
+# think about. A directory you name is yours and is never touched.
 #BOXY_WORKDIR_BASE="${TMPDIR:-/tmp}/boxy"
