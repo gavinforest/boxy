@@ -512,15 +512,15 @@ usage_create() {
     cat >&2 <<'EOF'
 usage: boxy create [TARGET] [options]
 
-TARGET says what lands in /work:
+TARGET determines host directory to be mounted as /work:
 
-  .  or PATH    mount that directory              boxy create .
-  worktree      a new git worktree of the repo    boxy create worktree
-                you are standing in
-  (omitted)     a fresh scratch dir in $TMPDIR    boxy create
+  .  or PATH    TARGET -> /work                        boxy create .
+  worktree      make a git worktree of current dir     boxy create worktree
+                on host -> /work
+  (omitted)     new scratch dir in $TMPDIR -> /work    boxy create
 
-The worktree gets its own branch (boxy/NAME) and shares history with your
-repo, so commits made in the box are in your repo the moment they land.
+Worktree gets a new branch (boxy/NAME) and shares history with your
+repo, so commits made in the box are viewable in your repo.
 Your main checkout is not mounted and cannot be touched.
 
 options:
@@ -1681,27 +1681,27 @@ boxy $BOXY_VERSION — disposable SSH-reachable dev boxes
 
 usage: boxy <command> [options]
 
-CORE — boxy functionality
-  create [options]           create and start a box   (boxy create --help)
+CORE
+  create [TARGET]            . | worktree | PATH, or nothing for scratch
   ssh [NAME] [-- CMD]        interactive session, or one command
-  forward [NAME] [PORTS]     tunnel box ports to the SAME localhost ports
+  forward [NAME] [PORTS]     tunnel box ports to the SAME local ports
   rm NAME...                 remove a box (doesn't touch your files)
   ls                         list boxes
-  info [NAME]                one box in detail, checks config and reality
+  info [NAME]                one box in detail, config vs reality
   password [NAME]            print the stored sudo password
-  ssh-config [--install]     emit/install an ssh_config covering every box
-  build [--full]             build the images     (boxy build --help)
-  doctor [--verbose]         check the local setup; -v adds info per box
+  ssh-config [--install]     emit/install ssh_config for every box
+  build [--full]             build the images
+  doctor [--verbose]         check the local setup; -v adds per-box info
   config [--init]            show or scaffold configuration
 
-DOCKER PASSTHROUGH — wrappers that resolve container name, add boxy's
-defaults, then hand off. [Equivalent docker command in brackets].
-  exec [NAME] [CMD]          [docker exec]    a way in that does not use ssh
-  logs [NAME] [-f]           [docker logs]    the box's entrypoint narration
-  start|stop|restart [NAME]  [docker start…]  lifecycle
-  top [--watch]              [docker stats]   live CPU/memory per box
+DOCKER PASSTHROUGH — resolve the box name, then hand off to docker
+  exec [NAME] [CMD]          in as the box user, at /work
+  logs [NAME] [-f]           the box's entrypoint narration
+  start|stop|restart [NAME]  lifecycle; the sidecar follows the box
+  top [--watch]              boxes and sidecars  [docker stats]
 
 The name may be omitted whenever exactly one box exists.
+Full options: boxy create --help, boxy build --help
 EOF
 }
 
