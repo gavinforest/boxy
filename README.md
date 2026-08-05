@@ -87,7 +87,7 @@ no `StrictHostKeyChecking=no`.
 | `boxy password [NAME]` | Print the stored sudo password |
 | `boxy ssh-config [--install]` | Emit / install an `ssh_config` covering every box |
 | `boxy build [--full]` | Build the images |
-| `boxy doctor` | Check the local setup |
+| `boxy doctor` | Check the local setup, box count, and orphaned state |
 | `boxy config [--init]` | Show or scaffold configuration |
 
 **Docker passthroughs** — thin wrappers that resolve the box name, add boxy's
@@ -96,13 +96,14 @@ container name *is* the box name.
 
 | Command | Wraps | Why bother |
 | --- | --- | --- |
-| `boxy exec [NAME] [CMD]` | `docker exec` | Sets the box user, `$HOME` and `/work`; works when SSH is broken |
+| `boxy exec [NAME] [CMD]` | `docker exec` | Sets the box user, `$HOME` and `/work`; works when SSH is broken. Needs a terminal only for the no-command form |
 | `boxy logs [NAME] [-f]` | `docker logs` | The entrypoint's setup narration — the first place to look when a box misbehaves |
 | `boxy start\|stop\|restart` | `docker start/stop` | Re-applies egress isolation and re-pins the host key on the way back up |
 | `boxy top [--watch]` | `docker stats` | Filters to boxy-managed containers |
 | `boxy monitor up\|down` | `docker compose` | Points at the bundled monitoring stack |
 
-The name may be omitted whenever exactly one box exists.
+The name may be omitted whenever exactly one box exists. Proxy sidecars don't
+count toward that — a single `--net limited` box still lets you omit it.
 
 ### `boxy create`
 

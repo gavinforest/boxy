@@ -290,6 +290,31 @@ port_free() {
 
 state_dir_for() { printf '%s\n' "$BOXY_STATE_DIR/instances/$1"; }
 
+# Count state directories with no container behind them.
+#
+# These appear when a box is removed outside boxy (`docker rm` by hand). The
+# contents — host key, known_hosts, password — mean nothing without the
+# container, so they are pure litter.
+orphan_state_dirs() {
+    local d name
+    [ -d "$BOXY_STATE_DIR/instances" ] || return 0
+    for d in "$BOXY_STATE_DIR"/instances/*/; do
+        [ -d "$d" ] || continue
+        name="$(basename "$d")"
+        instance_exists "$name" || printf '%s\n' "$name"
+    done
+}
+
+prune_orphan_state() {
+    local name n=0
+    for name in $(orphan_state_dirs); do
+        rm -rf "$BOXY_STATE_DIR/instances/$name"
+        n=$(( n + 1 ))
+    done
+    [ "$n" -gt 0 ] && note "pruned $n orphaned state director$( [ "$n" = 1 ] && echo y || echo ies )"
+    return 0
+}
+
 # Read a boxy label off a container.
 #
 # Labels are boxy's entire state store, so this is the hottest call in the
@@ -325,9 +350,14 @@ inst_label() {
         | awk -v k="$key=" 'index($0, k) == 1 { print substr($0, length(k) + 1); exit }'
 }
 
-# All boxy-managed container names, oldest first.
+# Every BOX, oldest first.
+#
+# Filters on boxy.role=box, not merely boxy.managed=1: proxy sidecars carry
+# the managed label too, and counting them made "the name may be omitted when
+# exactly one box exists" false for any --net limited box — `boxy ssh` would
+# refuse with "there are 2".
 list_instances() {
-    docker ps -a --filter 'label=boxy.managed=1' --format '{{.Names}}' \
+    docker ps -a --filter 'label=boxy.role=box' --format '{{.Names}}' \
         | sort -t- -k2 -n 2>/dev/null || true
 }
 
@@ -350,7 +380,12 @@ resolve_instance() {
         local all count
         all="$(list_instances)"
         count="$(printf '%s\n' "$all" | grep -c . || true)"
-        [ "$count" = "1" ] || die "instance name required (there are $count)"
+        if [ "$count" = "0" ]; then
+            die "no boxes exist — create one with 'boxy create'"
+        fi
+        if [ "$count" != "1" ]; then
+            die "$count boxes exist, so the name is not optional here: $(printf '%s' "$all" | tr '\n' ' ')"
+        fi
         name="$(printf '%s\n' "$all" | head -1)"
     fi
     require_instance "$name"
@@ -503,7 +538,7 @@ cmd_build() {
 usage: boxy build [--no-cache] [--full | --extras | --claude]
 
   (default)   numpy scipy pandas matplotlib-base jax marimo ipython uv
-              conda/mamba node  — the stack you asked for, ~2.7 GB
+              conda/mamba node  — the stack you asked for, 2.3 GB
   --extras    + jupyterlab polars pyarrow scikit-learn      (+462 MB)
   --claude    + @anthropic-ai/claude-code inside the box    (+291 MB)
   --full      both of the above
@@ -567,6 +602,7 @@ EOF
 
 cmd_create() {
     require_docker
+    prune_orphan_state
     nb_reset
     # The only non-zero return from parsing is --help, which has already
     # printed usage; anything genuinely wrong calls die() and exits.
@@ -674,6 +710,11 @@ create_validate() {
     fi
     if [ -n "$NB_MOUNT_DIR" ] && [ -n "$NB_REPO" ]; then
         die "--dir and --repo are mutually exclusive (mount a dir, or clone into a fresh one)"
+    fi
+    # Checked here rather than where the mount is set up, so a typo'd path
+    # fails before boxy generates a keypair and allocates ports.
+    if [ -n "$NB_MOUNT_DIR" ] && [ ! -d "$NB_MOUNT_DIR" ]; then
+        die "--dir: not a directory: $NB_MOUNT_DIR"
     fi
 
     image_exists "$NB_IMAGE" || die "image '$NB_IMAGE' not found — run: boxy build"
@@ -1169,10 +1210,23 @@ cmd_exec() {
     home="$(docker exec "$name" getent passwd "$user" 2>/dev/null | cut -d: -f6)"
     [ -n "$home" ] || home="/home/$user"
 
+    # -t only when there really is a terminal on both ends. `docker exec -it`
+    # from a script or a pipe fails outright with "cannot attach stdin to a
+    # TTY-enabled container", which is a confusing way to say "not a tty".
+    local tty_args
+    if [ -t 0 ] && [ -t 1 ]; then tty_args="-i -t"; else tty_args="-i"; fi
+
     if [ $# -eq 0 ]; then
-        exec docker exec -it -u "$user" -e "HOME=$home" -w /work "$name" bash -l
+        # Without a terminal there is nothing to drive an interactive shell,
+        # and `bash -l` on a pipe just blocks forever. Fail with a reason
+        # instead of hanging.
+        [ -t 0 ] && [ -t 1 ] \
+            || die "boxy exec with no command needs a terminal; pass a command, e.g. 'boxy exec $name \"ls /work\"'"
+        # shellcheck disable=SC2086
+        exec docker exec $tty_args -u "$user" -e "HOME=$home" -w /work "$name" bash -l
     fi
-    exec docker exec -i -u "$user" -e "HOME=$home" -w /work "$name" bash -lc "$*"
+    # shellcheck disable=SC2086
+    exec docker exec $tty_args -u "$user" -e "HOME=$home" -w /work "$name" bash -lc "$*"
 }
 
 cmd_forward() {
@@ -1419,6 +1473,17 @@ cmd_doctor() {
 
     printf '  %-24s %s\n' "config" "$BOXY_CONFIG_FILE"
     printf '  %-24s %s\n' "state" "$BOXY_STATE_DIR"
+
+    if docker info >/dev/null 2>&1; then
+        local boxes orphans
+        boxes="$(list_instances | grep -c . || true)"
+        orphans="$(orphan_state_dirs | grep -c . || true)"
+        printf '  %-24s %s\n' "boxes" "$boxes"
+        if [ "$orphans" -gt 0 ]; then
+            printf '  %-24s %s%s%s (removed outside boxy; the next create clears them)\n' \
+                "orphaned state" "$C_YEL" "$orphans" "$C_OFF"
+        fi
+    fi
     printf '\n'
     [ "$problems" -eq 0 ] || die "$problems problem(s) found"
     ok "looks healthy"

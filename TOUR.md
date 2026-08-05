@@ -58,6 +58,11 @@ defaults, then hand off. Equivalent plain-docker command in brackets.
 The name may be omitted whenever exactly one box exists.
 ```
 
+Sidecars do not count toward that: a `--net limited` box brings a proxy
+container carrying the same `boxy.managed` label, and an earlier version
+counted it — so `boxy ssh` on a single limited box refused with
+"there are 2". Name-omission now counts boxes (`boxy.role=box`) only.
+
 The passthroughs earn their place by resolving the box name and supplying
 defaults you would otherwise have to remember — `boxy exec` sets the box user,
 `$HOME` and `/work`; `boxy start` re-applies egress isolation and re-pins the

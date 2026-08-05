@@ -61,6 +61,10 @@ assert_contains "runs as the box user with a correct HOME" "HOME=/home/boxyboy" 
     "$(boxy exec boxy-1 'echo HOME=$HOME')"
 assert_eq "conda is on PATH here too" "/opt/conda/bin/python" \
     "$(boxy exec boxy-1 'command -v python')"
+# Without a terminal an interactive shell has nothing driving it and `bash -l`
+# blocks forever, so this must fail with a reason rather than hang.
+assert_contains "no command and no tty fails fast" "needs a terminal" \
+    "$(boxy exec boxy-1 < /dev/null 2>&1)"
 
 section "a default workdir is scratch space in the OS temp area"
 scratch_wd="$(boxy info cloned | awk '/^workdir/{print $2}')"
@@ -89,6 +93,39 @@ section "rm needs no flags and no confirmation"
 out="$(boxy rm cloned2 2>&1)"
 assert_contains "reports where the files went" "workdir left for the OS" "$out"
 assert_empty "gone without prompting" "$(docker ps -aq -f name='^cloned2$')"
+
+section "name-omission counts boxes, not sidecars"
+# A --net limited box brings a proxy container that also carries
+# boxy.managed=1. Counting it made "the name may be omitted when exactly one
+# box exists" false for every limited box.
+purge_all
+boxy create -n onlybox --net limited --no-git-key >/dev/null 2>&1
+assert_eq "two managed containers exist" "2" \
+    "$(docker ps -aq --filter 'label=boxy.managed=1' | grep -c .)"
+assert_contains "but the name is still optional" "onlybox" "$(boxy info 2>&1)"
+boxy rm onlybox >/dev/null 2>&1
+
+section "messages when the name cannot be inferred"
+assert_contains "no boxes at all" "no boxes exist" "$(boxy info 2>&1)"
+boxy create -n one --no-git-key >/dev/null 2>&1
+boxy create -n two --no-git-key >/dev/null 2>&1
+assert_contains "several boxes: names them" "one" "$(boxy info 2>&1)"
+purge_all
+
+section "create validates before doing work"
+assert_contains "a bad -d is caught up front" "not a directory" \
+    "$(boxy create -d /nope/nothing --no-git-key 2>&1)"
+assert_empty "and no keypair or state was created for it" \
+    "$(ls "$BOXY_STATE_DIR/instances" 2>/dev/null)"
+
+section "orphaned state is reported and reclaimed"
+boxy create -n orphan --no-git-key >/dev/null 2>&1
+docker rm -f orphan >/dev/null 2>&1          # removed behind boxy's back
+assert_contains "doctor notices it" "orphaned state" "$(boxy doctor 2>&1)"
+boxy create -n fresh --no-git-key >/dev/null 2>&1
+assert_empty "the next create reclaims it" \
+    "$(ls -d "$BOXY_STATE_DIR/instances/orphan" 2>/dev/null)"
+purge_all
 
 purge_all
 report "workflow"
