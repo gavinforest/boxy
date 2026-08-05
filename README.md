@@ -123,7 +123,6 @@ write `./worktree`.
 -b, --ref REF         commit-ish the worktree branches from (default: HEAD)
 -n, --name NAME       instance name (default: boxy-N)
     --password PASS   sudo password (default: random EFF passphrase)
-    --words N         words in the generated passphrase (default: 4)
 -u, --user NAME       login user (default: boxyboy)
 -k, --key PATH        public key to authorize (default: $BOXY_SSH_KEY.pub)
     --net MODE        full | none | limited   (default: full)

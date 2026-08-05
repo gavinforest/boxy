@@ -72,7 +72,6 @@ unset _BOXY_TMP
 : "${BOXY_MINIMAL_CAPS:=CHOWN DAC_OVERRIDE FOWNER KILL SETGID SETUID SYS_CHROOT NET_BIND_SERVICE NET_RAW AUDIT_WRITE}"
 
 : "${BOXY_NET:=full}"
-: "${BOXY_PASSWORD_WORDS:=4}"
 
 # Boxes do not come back on their own.
 #
@@ -216,8 +215,15 @@ ensure_wordlist() {
 # Four words from the EFF long list is ~51.7 bits of entropy. That is the
 # whole point of the 7776-word list: log2(7776) is exactly 12.925 bits per
 # word, and the words are chosen to be unambiguous when typed or dictated.
+#
+# The count is fixed. It was briefly tunable, which only ever offered a way to
+# pick a worse number: this password guards sudo inside a container whose SSH
+# is key-only, so anything above four buys nothing you can measure, and
+# anything below it is a downgrade nobody would choose deliberately.
+PASSWORD_WORDS=4
+
 gen_password() {
-    local words="$1" wl out i idx word
+    local words="$PASSWORD_WORDS" wl out i idx word
     out=""
     if ensure_wordlist; then
         wl="$(wordlist_path)"
@@ -527,7 +533,6 @@ options:
   -b, --ref REF         commit-ish the worktree branches from (default: HEAD)
   -n, --name NAME       instance name (default: boxy-N)
       --password PASS   sudo password (default: random EFF-wordlist passphrase)
-      --words N         words in the generated passphrase (default: 4)
   -u, --user NAME       login user inside the box (default: boxyboy)
   -k, --key PATH        public key to authorize (default: $BOXY_SSH_KEY.pub)
       --net MODE        full | none | limited          (default: full)
@@ -574,7 +579,7 @@ nb_reset() {
     NB_TARGET=""; NB_SOURCE=""; NB_MOUNT_DIR=""; NB_REF=""; NB_NAME=""
     NB_WT_REPO=""; NB_WT_GITDIR=""; NB_WT_BRANCH=""
     NB_PASSWORD=""; NB_PW_HASH=""; NB_PW_GENERATED=0
-    NB_WORDS="$BOXY_PASSWORD_WORDS"; NB_USER="$BOXY_USER"; NB_PUBKEY=""
+    NB_USER="$BOXY_USER"; NB_PUBKEY=""
     NB_NET="$BOXY_NET"; NB_IMAGE="$BOXY_IMAGE"
     NB_CAPS="$BOXY_CAPS"
     NB_CPUS="$BOXY_CPUS"; NB_MEMORY="$BOXY_MEMORY"
@@ -609,7 +614,6 @@ create_parse_args() {
             -b|--ref)       NB_REF="${2:?--ref needs a value}";            shift 2 ;;
             -n|--name)      NB_NAME="${2:?--name needs a value}";          shift 2 ;;
             --password)     NB_PASSWORD="${2:?--password needs a value}";  shift 2 ;;
-            --words)        NB_WORDS="${2:?--words needs a value}";        shift 2 ;;
             -u|--user)      NB_USER="${2:?--user needs a value}";          shift 2 ;;
             -k|--key)       NB_PUBKEY="${2:?--key needs a value}";         shift 2 ;;
             --net)          NB_NET="${2:?--net needs a value}";            shift 2 ;;
@@ -816,7 +820,7 @@ unused_branch_name() {
 
 create_prepare_password() {
     if [ -z "$NB_PASSWORD" ]; then
-        NB_PASSWORD="$(gen_password "$NB_WORDS")"
+        NB_PASSWORD="$(gen_password)"
         NB_PW_GENERATED=1
     fi
     NB_PW_HASH="$(hash_password "$NB_PASSWORD")"
@@ -1665,7 +1669,7 @@ cmd_config() {
     local k
     for k in BOXY_STATE_DIR BOXY_WORKDIR_BASE BOXY_IMAGE BOXY_PROXY_IMAGE BOXY_USER BOXY_SSH_KEY \
              BOXY_SSH_PORT_BASE BOXY_PORTS \
-             BOXY_BIND_ADDR BOXY_NET BOXY_CAPS BOXY_PASSWORD_WORDS BOXY_RESTART \
+             BOXY_BIND_ADDR BOXY_NET BOXY_CAPS BOXY_RESTART \
              BOXY_CPUS BOXY_MEMORY; do
         eval "printf '%-20s %s\n' $k \"\$$k\""
     done

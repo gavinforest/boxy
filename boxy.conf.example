@@ -71,11 +71,6 @@
 # `default` if you find one specific thing you need.
 #BOXY_MINIMAL_CAPS="CHOWN DAC_OVERRIDE FOWNER KILL SETGID SETUID SYS_CHROOT NET_BIND_SERVICE NET_RAW AUDIT_WRITE"
 
-# --- passwords ------------------------------------------------------------
-
-# Words drawn from the EFF long (7776-word) list. 4 words is ~51.7 bits.
-#BOXY_PASSWORD_WORDS=4
-
 # --- resources ------------------------------------------------------------
 
 # Whether a box comes back on its own after the Docker daemon restarts.
