@@ -86,6 +86,7 @@ no `StrictHostKeyChecking=no`.
 | `boxy ls` | List boxes with status, SSH port, net mode, workdir |
 | `boxy info [NAME]` | One box in detail, checked against reality |
 | `boxy password [NAME]` | Print the stored sudo password |
+| `boxy env [NAME] [K=V]` | Set / list environment variables the box sees |
 | `boxy ssh-config [--install]` | Emit / install an `ssh_config` covering every box |
 | `boxy build [--full]` | Build the images |
 | `boxy doctor [--verbose]` | Check the local setup; `-v` adds `boxy info` per box |
@@ -159,10 +160,63 @@ Two things to know:
   describing a container that no longer exists.
 - **`-e` does not reach `boxy ssh`.** The variable is set on the container, so
   the box's own processes and `boxy exec` see it, but an ssh session builds a
-  fresh environment through PAM and does not inherit PID 1's. This is not new —
-  the old `--env` flag had exactly the same limitation, since it produced the
-  same `docker run -e`. For a value you need in ssh sessions, write it into
-  `~/.profile` in the box.
+  fresh environment through PAM and does not inherit PID 1's. Use `boxy env`
+  below, which reaches both.
+
+---
+
+## Environment variables
+
+```bash
+boxy env boxy-1 API_KEY=secret REGION=us-east-1   # set
+boxy env boxy-1                                   # list
+boxy env boxy-1 --unset REGION                    # remove
+```
+
+Visible to `ssh box cmd`, an interactive `ssh box`, and `boxy exec` alike, and
+they survive `boxy stop` / `boxy start`.
+
+It is one file in the box, `/etc/boxy-env`, holding `KEY=VALUE` one per line.
+Two things read it, and boxy's entrypoint already writes both of them for the
+`cd /work` behaviour:
+
+| | reached via |
+| --- | --- |
+| `ssh box cmd` | `~/.bashrc` — bash reads it even non-interactively when sshd started the shell |
+| `ssh box` (interactive) | `/etc/profile.d/boxy-env.sh` |
+| `boxy exec` | `/etc/profile.d/boxy-env.sh` |
+
+`ssh box cmd` is the awkward one: it reads no profile and no rc of its own.
+Bash has a special case for shells started by sshd, and boxy's block sits at
+the *top* of `~/.bashrc`, above the `case $- in *i*) ;; *) return;; esac` guard
+Debian ships — below it, the non-interactive case returns before ever reaching
+the block.
+
+There is no host-side copy and nothing replayed on start. The file lives in the
+container and the container filesystem survives a restart untouched. Values
+need no quoting either: the loader uses `export "$line"`, which passes the
+whole assignment as one argument, so `K=two words` works with nothing escaped.
+
+`PATH` and `BOXY_*` are refused — `PATH` because replacing the box's own breaks
+every command in it, `BOXY_*` because it is boxy's channel into the entrypoint.
+
+### Picking up a change without reconnecting
+
+The rc and profile files run once, at session start, so a session that was
+already open when you ran `boxy env` still has the old environment. Nothing
+outside a shell can change a running shell's environment — a process cannot
+write its parent's — so the refresh has to be something the session runs on
+itself:
+
+```bash
+. /etc/profile.d/boxy-env.sh
+```
+
+The leading `.` is the shell's **source** command (`source` is bash's alias for
+the same builtin; `.` is the POSIX spelling). It runs the file in the *current*
+shell instead of forking a child, which is the entire point: a child's exported
+variables die with the child, so `bash /etc/profile.d/boxy-env.sh` would
+accomplish nothing at all. `.` means "here", not "over there".
 
 ---
 

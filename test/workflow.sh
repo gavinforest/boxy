@@ -202,6 +202,67 @@ boxy create -n two >/dev/null 2>&1
 assert_contains "several boxes: names them" "one" "$(boxy info 2>&1)"
 purge_all
 
+section "boxy env reaches every way into the box"
+# The sharp case is `ssh box cmd`: it reads no profile and no rc of its own.
+# It works because bash sources ~/.bashrc when sshd started it, and boxy's
+# block at the top of .bashrc — above Debian's non-interactive guard — sources
+# the loader.
+boxy create -n envb >/dev/null 2>&1
+boxy env envb API_KEY=secret123 REGION=us-east-1 >/dev/null 2>&1
+assert_eq "non-interactive ssh sees it" "secret123" "$(bssh envb 'echo $API_KEY')"
+assert_eq "a login shell sees it"       "secret123" \
+    "$(bssh envb 'bash -lc "echo \$API_KEY"')"
+assert_eq "boxy exec sees it too"       "secret123" "$(boxy exec envb 'echo $API_KEY')"
+assert_contains "and it lists" "REGION=us-east-1" "$(boxy env envb)"
+# The block has to be above the guard or the non-interactive case returns
+# before reaching it.
+assert_contains "the loader is sourced from the boxy block" "boxy-env.sh" \
+    "$(docker exec envb head -4 /home/boxyboy/.bashrc)"
+
+section "env survives a restart with no host state"
+# Nothing is replayed on start: the file lives in the container, and the
+# container filesystem survives a restart untouched.
+boxy stop envb >/dev/null 2>&1; boxy start envb >/dev/null 2>&1
+assert_eq "still set after stop/start" "secret123" "$(bssh envb 'echo $API_KEY')"
+assert_empty "and boxy keeps no host-side copy" \
+    "$(ls "$BOXY_STATE_DIR/instances/envb/env" 2>/dev/null)"
+
+section "env rewrites rather than appends"
+boxy env envb API_KEY=rotated >/dev/null 2>&1
+assert_eq "the new value wins" "rotated" "$(bssh envb 'echo $API_KEY')"
+assert_eq "and the key appears once" "1" \
+    "$(docker exec envb grep -c '^API_KEY=' /etc/boxy-env)"
+boxy env envb --unset REGION >/dev/null 2>&1
+assert_empty "unset clears it" "$(bssh envb 'echo $REGION')"
+
+section "env values need no quoting"
+# The data file is plain KEY=VALUE and the loader uses `export "$line"`, which
+# passes the whole assignment as one argument. Nothing re-parses a value as
+# shell, so these are all literals.
+boxy env envb 'SPACED=two words' "QUOTED=it's quoted" 'DOLLAR=$notexpanded' >/dev/null 2>&1
+assert_eq "spaces via ssh"  "two words"     "$(bssh envb 'echo $SPACED')"
+assert_eq "quote via ssh"   "it's quoted"   "$(bssh envb 'echo $QUOTED')"
+assert_eq "quote via exec"  "it's quoted"   "$(boxy exec envb 'echo $QUOTED')"
+assert_eq "no expansion"    '$notexpanded'  "$(boxy exec envb 'echo $DOLLAR')"
+
+section "a live session can pick up a change"
+# pam_env and the rc files run once, at session start. Nothing outside a shell
+# can alter its environment, so a refresh is the session sourcing the loader.
+boxy env envb LIVE=yes >/dev/null 2>&1
+assert_eq "sourcing the loader applies it" "yes" \
+    "$(bssh envb 'unset LIVE; . /etc/profile.d/boxy-env.sh; echo $LIVE')"
+
+section "env refuses names that belong to boxy"
+assert_contains "PATH is refused" "belong to boxy" "$(boxy env envb PATH=/evil 2>&1)"
+assert_eq "and PATH is intact" "/opt/conda/bin" "$(bssh envb 'echo ${PATH%%:*}')"
+assert_contains "BOXY_* is refused" "belong to boxy" \
+    "$(boxy env envb BOXY_PASSWORD_HASH=x 2>&1)"
+assert_eq "the sudo hash never lands in the file" "0" \
+    "$(docker exec envb sh -c 'grep -c BOXY_PASSWORD_HASH /etc/boxy-env || true')"
+assert_contains "a non-identifier is refused" "must be identifiers" \
+    "$(boxy env envb 9bad=x 2>&1)"
+purge_all
+
 section "create validates before doing work"
 assert_contains "a bad path is caught up front" "not a directory" \
     "$(boxy create /nope/nothing 2>&1)"

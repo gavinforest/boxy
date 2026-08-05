@@ -1364,6 +1364,126 @@ cmd_password() {
     [ -f "$f" ] || die "no stored password for $name"
     cat "$f"
 }
+# ===========================================================================
+# env
+# ===========================================================================
+# One file in the box, /etc/boxy-env, holding KEY=VALUE one per line. Two
+# things read it, and the entrypoint already writes both of them for the
+# `cd /work` feature, so this needs no new machinery in the image:
+#
+#   /etc/profile.d/boxy-env.sh   the loader. Login shells run every profile.d
+#                                snippet, which covers an interactive
+#                                `ssh box` and `boxy exec`.
+#   ~/.bashrc                    the boxy block at the top sources that loader.
+#                                Bash reads .bashrc even for a NON-interactive
+#                                `ssh box cmd` when sshd started it — the case
+#                                an agent driving the box hits constantly, and
+#                                the one that reads no profile at all.
+#
+# So there is no host-side copy and nothing to replay on start: the file lives
+# in the container, and the container filesystem survives a restart untouched.
+# An earlier draft used /etc/environment for the non-interactive case, which
+# forced host state, because the entrypoint truncates that file on every start.
+# ~/.bashrc reaches the same case with none of it.
+BOXY_ENV_FILE=/etc/boxy-env
+
+# PATH is refused because the box's own is set from the image and replacing it
+# breaks every command in the box. BOXY_* is refused because that is boxy's
+# channel into the entrypoint.
+env_key_ok() {
+    case "$1" in
+        PATH|BOXY_*) return 1 ;;
+    esac
+    printf '%s' "$1" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'
+}
+
+box_env_read() { docker exec "$1" cat "$BOXY_ENV_FILE" 2>/dev/null || true; }
+
+# Over stdin, so a value never passes through a shell on the way in. There is
+# nothing to quote and nothing to escape.
+box_env_write() {
+    printf '%s' "$2" | docker exec -i -u root "$1" \
+        sh -c "cat > $BOXY_ENV_FILE && chmod 644 $BOXY_ENV_FILE"
+}
+
+cmd_env() {
+    require_docker
+    local name="" mode="set"
+    local keys=() vals=() unsets=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --unset) mode="unset"; shift ;;
+            -h|--help)
+                printf 'usage: boxy env [NAME] [KEY=VALUE ...] [--unset KEY ...]\n'
+                printf '  with no assignments, lists what is set\n'
+                printf '  in a session already open: . /etc/profile.d/boxy-env.sh\n'
+                return 0 ;;
+            -*) die "env: unknown option $1" ;;
+            *=*) keys[${#keys[@]}]="${1%%=*}"; vals[${#vals[@]}]="${1#*=}"; shift ;;
+            *)
+                if [ "$mode" = "unset" ]; then
+                    unsets[${#unsets[@]}]="$1"
+                elif [ -z "$name" ]; then
+                    name="$1"
+                else
+                    die "env: '$1' is neither NAME nor KEY=VALUE"
+                fi
+                shift ;;
+        esac
+    done
+    name="$(resolve_instance "$name")"
+
+    local current; current="$(box_env_read "$name")"
+    if [ "${#keys[@]}" -eq 0 ] && [ "${#unsets[@]}" -eq 0 ]; then
+        if [ -n "$current" ]; then printf '%s\n' "$current"
+        else info "no variables set for $name"; fi
+        return 0
+    fi
+
+    docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null | grep -q true \
+        || die "env: $name is not running — the variables live in the box, so start it first"
+
+    local k v i=0
+    for k in ${keys[@]+"${keys[@]}"}; do
+        env_key_ok "$k" \
+            || die "env: refusing '$k' — names must be identifiers, and PATH and BOXY_* belong to boxy"
+    done
+    while [ "$i" -lt "${#keys[@]}" ]; do
+        case "${vals[$i]}" in
+            *"
+"*) die "env: ${keys[$i]} has a newline in its value; the file is one variable per line" ;;
+        esac
+        i=$(( i + 1 ))
+    done
+
+    # Everything we are not touching, then the new set — so a key set twice
+    # appears once, with the newer value.
+    local out="" line skip
+    if [ -n "$current" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            k="${line%%=*}"
+            skip=0
+            for v in ${keys[@]+"${keys[@]}"} ${unsets[@]+"${unsets[@]}"}; do
+                [ "$k" = "$v" ] && skip=1
+            done
+            [ "$skip" = "1" ] || out="$out$line
+"
+        done <<< "$current"
+    fi
+    i=0
+    while [ "$i" -lt "${#keys[@]}" ]; do
+        out="$out${keys[$i]}=${vals[$i]}
+"
+        i=$(( i + 1 ))
+    done
+
+    box_env_write "$name" "$out"
+    local n; n="$(printf '%s' "$out" | grep -c . || true)"
+    ok "$name now has $n variable(s) set"
+    note "new ssh sessions and 'boxy exec' see them; they survive a restart"
+    note "in a session already open: . /etc/profile.d/boxy-env.sh"
+}
 
 # ===========================================================================
 # ssh / exec / forward
@@ -1728,6 +1848,7 @@ CORE
   ls                         list boxes
   info [NAME]                one box in detail, config vs reality
   password [NAME]            print the stored sudo password
+  env [NAME] [K=V ...]       set/list env vars the box sees
   ssh-config [--install]     emit/install ssh_config for every box
   build [--full]             build the images
   doctor [--verbose]         check the local setup; -v adds per-box info
@@ -1758,6 +1879,7 @@ main() {
         exec|sh)     cmd_exec "$@" ;;
         forward|fwd) cmd_forward "$@" ;;
         password|pw) cmd_password "$@" ;;
+        env)         cmd_env "$@" ;;
         ssh-config)  cmd_ssh_config "$@" ;;
         start)       cmd_start "$@" ;;
         stop)        cmd_stop "$@" ;;

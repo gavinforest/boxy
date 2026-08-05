@@ -212,15 +212,42 @@ fi
 printf 'cd %q 2>/dev/null || true\n' "$BOXY_WORKDIR" > /etc/profile.d/boxy-cd.sh
 chmod 644 /etc/profile.d/boxy-cd.sh
 
+# The loader for `boxy env`. It reads /etc/boxy-env, which holds KEY=VALUE one
+# per line and is the only file `boxy env` ever writes.
+#
+# `export "$line"` passes the whole assignment as a single argument, so a value
+# containing spaces needs no quoting anywhere — which is why the data file can
+# stay plain KEY=VALUE rather than generated shell.
+#
+# Sourcing this by hand is how a session that is already open picks up a
+# change; nothing outside a shell can alter its environment.
+cat > /etc/profile.d/boxy-env.sh <<'BOXYENV'
+# Managed by boxy. Applies the variables set with `boxy env`.
+if [ -r /etc/boxy-env ]; then
+    while IFS= read -r _boxy_line; do
+        case "$_boxy_line" in ''|\#*) continue ;; esac
+        export "$_boxy_line"
+    done < /etc/boxy-env
+    unset _boxy_line
+fi
+BOXYENV
+chmod 644 /etc/profile.d/boxy-env.sh
+[[ -e /etc/boxy-env ]] || { : > /etc/boxy-env; chmod 644 /etc/boxy-env; }
+
 BASHRC="$USER_HOME/.bashrc"
 if ! grep -q '^# >>> boxy >>>' "$BASHRC" 2>/dev/null; then
     # This block must sit ABOVE the `case $- in *i*) ;; *) return;; esac` guard
     # Debian ships at the top of .bashrc, or the non-interactive case returns
     # before ever reaching it.
+    #
+    # Sourcing the env loader here is what lets `boxy env` reach a
+    # non-interactive `ssh box cmd`: profile.d covers login shells only, and
+    # that case is not one.
     boxy_tmp="$(mktemp)"
     {
         printf '# >>> boxy >>>\n'
         printf 'cd %q 2>/dev/null || true\n' "$BOXY_WORKDIR"
+        printf '[ -r /etc/profile.d/boxy-env.sh ] && . /etc/profile.d/boxy-env.sh\n'
         printf '# <<< boxy <<<\n'
         cat "$BASHRC" 2>/dev/null || true
     } > "$boxy_tmp"
