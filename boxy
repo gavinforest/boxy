@@ -546,18 +546,17 @@ options:
       --cpus N          CPU limit
       --memory SIZE     memory limit, e.g. 8g
 
-Anything after `--` is passed to `docker run` unchanged, so boxy needs no
-wrapper flag of its own for each docker feature:
+Anything after `--` is passed to `docker run` unchanged, for example:
 
   boxy create . -- -v ~/data:/data
   boxy create . -- --gpus all --shm-size 2g
 
-These land after boxy's own flags, so where docker takes the last value of a
-repeated flag, yours wins. Two caveats:
+These are after boxy's own flags, so whenever docker takes the last value
+of a repeated flag (most of the time), manual ones win. Two exceptions:
 
   --network   boxy's to set; use --net full|none|limited instead
   -e K=V      reaches the box's processes and `boxy exec`, but NOT `boxy ssh`
-              sessions, which get a fresh environment from PAM
+              sessions (gets environment from PAM). Use `boxy env` instead.
 EOF
 }
 
@@ -1848,7 +1847,7 @@ CORE
   ls                         list boxes
   info [NAME]                one box in detail, config vs reality
   password [NAME]            print the stored sudo password
-  env [NAME] [K=V ...]       set/list env vars the box sees
+  env [NAME] [K=V ...]       list or set/inject env vars
   ssh-config [--install]     emit/install ssh_config for every box
   build [--full]             build the images
   doctor [--verbose]         check the local setup; -v adds per-box info
