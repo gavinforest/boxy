@@ -321,6 +321,29 @@ $ boxy ssh boxy-1 -- 'cd /work && git commit -am wip'
 $ git log --oneline boxy/boxy-1     # on the host, right away
 ```
 
+**Only committed content crosses over.** A worktree is a checkout of a commit,
+not a copy of your working directory, so the box gets exactly what is in `HEAD`
+and nothing else. Staying behind on the host:
+
+- edits to tracked files you have not committed — the box sees the committed
+  version, not yours
+- files that are staged but not committed
+- untracked files, including ones you just have not `git add`ed yet
+- everything `.gitignore` matches: `.venv/`, `node_modules/`, `data/`, build
+  outputs
+
+This is the most common first-run surprise, and a quiet `git status` does not
+rule it out, because ignored files never appear there. If a box comes up
+looking half-empty, the count is the fast check:
+
+```bash
+$ git status --short          # uncommitted and untracked
+$ git ls-files | wc -l        # how many files a worktree box will actually get
+```
+
+Submodules are empty in a new worktree too — `git worktree add` does not
+populate them.
+
 **How.** A worktree's `.git` is a _file_ holding an absolute path back to the
 main repository's git directory. Mount only the worktree and the box has a
 broken repo, so boxy also mounts that git directory at the identical path
