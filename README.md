@@ -491,6 +491,24 @@ boxy-sidecar-<name>` directly; the container name is always
 The shipped allowlist covers PyPI, conda-forge, GitHub, npm, Debian, Hugging
 Face and the Anthropic API.
 
+**Entries are domains, not patterns.** The sidecar compiles the list into POSIX
+extended regexes and escapes only dots, so anything else with meaning in a regex
+would survive into the pattern and widen the policy silently — `[^q]*` becomes
+`^(.*\.)?[^q]*$`, which matches every domain there is. Every way into the list
+is checked against the same rule: `--allow`, `boxy allow`, and the file itself.
+
+```
+$ boxy create --net limited --allow '*.example.com'
+error: --allow: '*.example.com' — drop the '*.', subdomains are already included
+
+$ boxy allow web 'not a domain'
+error: allow: 'not a domain' is not a domain. Entries become regexes in the
+       proxy's filter, so only letters, digits, hyphens and dots are accepted
+```
+
+Subdomains are always included, which is why there is no wildcard syntax to
+get wrong: `github.com` already covers `api.github.com`.
+
 **The shared allowlist is read once, at `boxy create`**, and copied to a file of
 the box's own:
 

@@ -134,6 +134,8 @@ assert_contains "so is a bare word with no dot" "is not a domain" \
     "$(boxy allow ltd nodots 2>&1)"
 assert_contains "--net none has no proxy to widen" "no egress at all" \
     "$(boxy allow nonet example.com 2>&1)"
+assert_contains "the '*.' mistake gets an answer, not just a refusal" \
+    "subdomains are already included" "$(boxy allow ltd '*.example.com' 2>&1)"
 assert_eq "a repeated domain does not duplicate the line" "1" \
     "$(boxy allow ltd example.com >/dev/null 2>&1; grep -cx 'example.com' \
        "$BOXY_STATE_DIR/instances/ltd/proxy/allowlist.txt")"
@@ -141,6 +143,28 @@ assert_contains "--reload drops per-box additions" "domains added" \
     "$(boxy allow ltd --reload 2>&1)"
 assert_eq "and the domain is blocked again" "403" \
     "$(bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 15 http://example.com/')"
+
+# `boxy create --allow` used to skip the domain check entirely, so the two
+# writers of one file disagreed about what a domain is — and the looser of them
+# ran at create time. Only dots are escaped when the file is compiled, so
+# `[^q]*` reached the filter as `^(.*\.)?[^q]*$` and matched every domain there
+# is; a box created that way was reported as restricted and was not.
+section "one domain check guards every way into the allowlist"
+assert_contains "create --allow refuses a regex too" "is not a domain" \
+    "$(boxy create -n regex1 --net limited --allow '[^q]*' 2>&1)"
+assert_empty "and builds nothing for it" \
+    "$(ls -d "$BOXY_STATE_DIR/instances/regex1" 2>/dev/null)"
+# A hand-edited allowlist.txt is the third way in, and the one boxy never
+# watched you type — so it is reported with a line number.
+cp "$BOXY_CONFIG_DIR/allowlist.txt" "$TEST_TMP/allowlist.keep"
+printf '\n*.internal.corp\n' >> "$BOXY_CONFIG_DIR/allowlist.txt"
+assert_contains "a bad line in the file names the line" "allowlist.txt line" \
+    "$(boxy create -n regex2 --net limited 2>&1)"
+assert_contains "and --reload will not install it either" "allowlist.txt line" \
+    "$(boxy allow ltd --reload 2>&1)"
+assert_eq "so the running box never picked it up" "0" \
+    "$(grep -c 'internal.corp' "$BOXY_STATE_DIR/instances/ltd/proxy/allowlist.txt" || true)"
+cp "$TEST_TMP/allowlist.keep" "$BOXY_CONFIG_DIR/allowlist.txt"
 
 # The counter ticks when the replacement proxy is launched, not once it has
 # taken the port, so a proxy that cannot start must not be reported as a live

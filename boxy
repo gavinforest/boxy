@@ -126,6 +126,10 @@ WORDLIST_COUNT=7776
 
 DEFAULT_ALLOWLIST='# boxy egress allowlist — one domain per line, subdomains included.
 # Used by `boxy create --net limited`. Edit freely.
+#
+# Domains only: letters, digits, hyphens, dots. No wildcards — subdomains are
+# already covered, so github.com includes api.github.com. Anything else is
+# refused by name and line, because these become regexes in the proxy filter.
 
 # Python
 pypi.org
@@ -477,6 +481,33 @@ ensure_allowlist() {
     fi
 }
 
+# Every domain that reaches the allowlist has to pass this, whichever way it
+# got there — `--allow`, `boxy allow`, or a line you typed into allowlist.txt.
+#
+# The file is compiled into a list of POSIX extended regexes by the sidecar,
+# and only dots are escaped on the way. So anything else with meaning in an ERE
+# survives into the pattern and quietly widens the policy: `[^q]*` compiles to
+# `^(.*\.)?[^q]*$`, which matches every domain there is. That is the whole
+# reason this check exists, and why it has to guard the file as well as the
+# flag — a policy you cannot trust to say what it enforces is worse than none.
+#
+# Labels are alphanumeric with inner hyphens, and at least one dot is required
+# so that a mistyped box name cannot be mistaken for a domain.
+domain_ok() {
+    printf '%s' "$1" | grep -Eq \
+        '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+}
+
+# Say why it was refused, not merely that it was. A leading `*.` is the mistake
+# people actually make, and it is worth answering rather than just rejecting.
+domain_refused() {
+    local d="$1" where="$2"
+    case "$d" in
+        \*.*) die "$where: '$d' — drop the '*.', subdomains are already included" ;;
+    esac
+    die "$where: '$d' is not a domain. Entries become regexes in the proxy's filter, so only letters, digits, hyphens and dots are accepted"
+}
+
 # ===========================================================================
 # Networks
 # ===========================================================================
@@ -721,7 +752,7 @@ nb_reset() {
     NB_IDX=""; NB_SSH_PORT=""; NB_PUBLISHED=""
     NB_SDIR=""; NB_WORKDIR=""; NB_AUTHORIZED_KEYS=""
     NB_NET_NAME=""; NB_SIDECAR_NAME=""; NB_PROXY_URL=""
-    NB_ALLOW=(); NB_PUBLISH=(); NB_DOCKER=()
+    NB_ALLOW=(); NB_PUBLISH=(); NB_DOCKER=(); NB_ALLOWLIST=""
     RUN_ARGS=()
 }
 
@@ -827,12 +858,50 @@ create_validate() {
         image_exists "$BOXY_PROXY_IMAGE" \
             || die "proxy image '$BOXY_PROXY_IMAGE' not found — run: boxy build"
         ensure_allowlist
+        # Assembled and checked HERE rather than where it is written, so a
+        # typo is caught before create makes a worktree or a password.
+        create_resolve_allowlist
     fi
 
     ensure_ssh_key
     [ -n "$NB_PUBKEY" ] || NB_PUBKEY="$BOXY_SSH_KEY.pub"
     [ -f "$NB_PUBKEY" ] || die "public key not found: $NB_PUBKEY"
     NB_AUTHORIZED_KEYS="$(cat "$NB_PUBKEY")"
+}
+
+# The box's egress policy: the shared allowlist, plus anything from --allow.
+#
+# Both sources are validated, which they were not before: `boxy allow` refused
+# a domain that was not one, while `boxy create --allow '[^q]*'` wrote the same
+# string straight through to the proxy's filter, where it matched everything.
+# Two writers of one file disagreeing about what a domain is, with the looser
+# of them running at create time.
+#
+# The line number is reported for the file, because "line 12" is the only
+# useful thing to say about a file you did not type in this command.
+create_resolve_allowlist() {
+    local f line domain n=0
+    f="$(allowlist_file)"
+
+    NB_ALLOWLIST=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$(( n + 1 ))
+        domain="${line%%#*}"
+        domain="$(printf '%s' "$domain" | tr -d '[:space:]')"
+        [ -z "$domain" ] && continue
+        domain_ok "$domain" || domain_refused "$domain" "$f line $n"
+        NB_ALLOWLIST="$NB_ALLOWLIST$domain
+"
+    done < "$f"
+
+    for domain in ${NB_ALLOW[@]+"${NB_ALLOW[@]}"}; do
+        domain_ok "$domain" || domain_refused "$domain" "--allow"
+        NB_ALLOWLIST="$NB_ALLOWLIST$domain
+"
+    done
+
+    [ -n "$NB_ALLOWLIST" ] \
+        || die "egress allowlist is empty ($f); nothing would be reachable"
 }
 
 # Work out what the single positional means, and prove it can work before
@@ -1032,19 +1101,14 @@ ${pair%%:*}:$NB_NAME:${pair##*:}"
     local mounts=()
     if [ "$NB_NET" = "limited" ]; then
         NB_PROXY_URL="http://$NB_SIDECAR_NAME:8888"
-        local allowlist a
-        allowlist="$(grep -v '^[[:space:]]*#' "$(allowlist_file)" | grep -v '^[[:space:]]*$' || true)"
-        for a in ${NB_ALLOW[@]+"${NB_ALLOW[@]}"}; do
-            allowlist="$allowlist
-$a"
-        done
-        [ -n "$allowlist" ] || die "egress allowlist is empty; nothing would be reachable"
 
         # The box's own copy of the policy, taken now and never re-read from
         # the shared file: editing that file is meant to affect the next box,
-        # not silently rewrite the rules under boxes already running.
+        # not silently rewrite the rules under boxes already running. Comments
+        # and blank lines are gone by here, and every entry has been checked —
+        # create_resolve_allowlist did both, back in create_validate.
         mkdir -p "$(proxy_dir_for "$NB_NAME")"
-        printf '%s\n' "$allowlist" > "$(box_allowlist_file "$NB_NAME")"
+        printf '%s' "$NB_ALLOWLIST" > "$(box_allowlist_file "$NB_NAME")"
 
         # Mounted rather than passed as an environment variable, because an
         # environment variable is fixed for the life of a container and this
@@ -1668,15 +1732,6 @@ cmd_env() {
 # session and every forward. Its PID 1 restarts only tinyproxy, in place.
 BOXY_PROXY_GENERATION=/run/boxy-proxy-generation
 
-# Domains are written into a file that becomes a list of extended regexes, so
-# this is the check that stops a fat-fingered `*` or `.*` from quietly allowing
-# everything. Labels are alphanumeric with inner hyphens, and at least one dot
-# is required so that a mistyped box name cannot be mistaken for a domain.
-allow_domain_ok() {
-    printf '%s' "$1" | grep -Eq \
-        '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
-}
-
 allow_require_limited() {
     local name="$1" net
     net="$(inst_label "$name" boxy.net)"
@@ -1735,10 +1790,10 @@ cmd_allow() {
                 # A bare word is the box unless a box by that name is already
                 # ruled out and it parses as a domain. Names are checked first
                 # so that a box someone named with a dot still resolves.
-                if [ -z "$name" ] && { instance_exists "$1" || ! allow_domain_ok "$1"; }; then
+                if [ -z "$name" ] && { instance_exists "$1" || ! domain_ok "$1"; }; then
                     name="$1"
                 else
-                    allow_domain_ok "$1" || die "allow: '$1' is not a domain"
+                    domain_ok "$1" || domain_refused "$1" "allow"
                     domains[${#domains[@]}]="$1"
                 fi
                 shift ;;
@@ -1768,8 +1823,12 @@ cmd_allow() {
 
     local out d
     if [ "$mode" = "reload" ]; then
-        out="$(grep -v '^[[:space:]]*#' "$(allowlist_file)" | grep -v '^[[:space:]]*$' || true)"
-        [ -n "$out" ] || die "allow: $(allowlist_file) is empty; nothing would be reachable"
+        # The same reader `boxy create` uses, so --reload cannot install a
+        # policy that create would have refused. It sets NB_ALLOWLIST, which
+        # is harmless here: cmd_allow never runs alongside a create.
+        NB_ALLOW=()
+        create_resolve_allowlist
+        out="$(printf '%s' "$NB_ALLOWLIST")"
     else
         out="$(cat "$f")"
     fi
