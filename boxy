@@ -569,7 +569,7 @@ usage: boxy build [--no-cache] [--full | --extras | --claude]
   --claude    + @anthropic-ai/claude-code inside the box    (+291 MB)
   --full      both of the above
 
-Anything omitted is still one `uv pip install` away inside a running box.
+Anything omitted is still one `uv install` away inside a running box.
 EOF
                 return 0 ;;
             *) die "build: unknown option $1" ;;
@@ -2343,19 +2343,19 @@ boxy $BOXY_VERSION — disposable SSH-reachable dev boxes
 usage: boxy <command> [options]
 
 CORE
-  create [TARGET]            . | worktree | PATH, or nothing for scratch
+  create [TARGET]            worktree | PATH, or nothing for scratch
   ssh [NAME] [-- CMD]        interactive session, or one command
   forward [NAME] [PORTS]     tunnel box ports to the SAME local ports
   rm NAME...                 remove a box (doesn't touch your files)
   ls                         list boxes
-  info [NAME]                one box in detail, config vs reality
-  password [NAME]            print the stored sudo password
+  info [NAME]                one box in detail, config and reality
+  password [NAME]            print the stored sudo password for [NAME]
   env [NAME] [K=V ...]       list or set/inject env vars
   allow [NAME] [DOMAIN ...]  widen a running box's egress, no restart
   ssh-config [--install]     emit/install ssh_config for every box
   build [--full]             build the images
   doctor [--verbose]         check the local setup; -v adds per-box info
-  config [--init]            show or scaffold configuration
+  config [--init] [PATH]     show or install (default if no PATH) config
 
 DOCKER PASSTHROUGH — resolve the box name, then hand off to docker
   exec [NAME] [CMD]          adds defaults: as box user, at /work
