@@ -46,6 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
     sudo \
     tini \
+    zsh \
     ca-certificates \
     curl \
     wget \
@@ -91,9 +92,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # it, because everything below runs as this user. A `RUN chown -R` afterwards
 # would rewrite every one of ~40k conda files into a fresh layer and double the
 # image size — layers are copy-on-write per file, and a metadata change counts.
+#
+# The login shell is zsh, so `boxy ssh` lands in it. bash is untouched and
+# still fully configured — `boxy exec` uses `bash -l` deliberately, which keeps
+# a working way in if anything here ever breaks the zsh startup files.
 RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
     && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home \
-    --shell /bin/bash "${USERNAME}" \
+    --shell /usr/bin/zsh "${USERNAME}" \
     && usermod -aG sudo "${USERNAME}" \
     && install -d -m 700 -o "${USER_UID}" -g "${USER_GID}" /home/"${USERNAME}"/.ssh \
     && install -d -m 755 -o "${USER_UID}" -g "${USER_GID}" "${CONDA_DIR}" \
@@ -202,6 +207,32 @@ RUN set -eux; \
 RUN "${CONDA_DIR}/bin/conda" init bash \
     && echo '. /opt/conda/etc/profile.d/conda.sh && conda activate base' \
     >> "$HOME/.bashrc"
+
+# ---------------------------------------------------------------------------
+# zsh prompt
+# ---------------------------------------------------------------------------
+# The theme is read-only and system-wide; docker/zshrc supplies the handful of
+# helpers it expects and is the box user's own .zshrc. See that file for why
+# there is no oh-my-zsh.
+#
+# What zsh does NOT inherit is the part worth knowing: Debian's
+# /etc/zsh/zprofile is comments only — it never sources /etc/profile — so none
+# of boxy's /etc/profile.d files reach a zsh login shell. PATH and the proxy
+# survive regardless, because sshd's pam_env reads /etc/environment, but
+# `cd /work` and the `boxy env` loader do not. docker/entrypoint.sh puts those
+# in ~/.zshenv, which zsh reads on every invocation.
+# COPY runs as root whatever USER is in force, so the theme lands root-owned
+# and world-readable without switching back and forth.
+COPY docker/crunch-custom.zsh-theme /etc/zsh/crunch-custom.zsh-theme
+COPY --chown=${USER_UID}:${USER_GID} docker/zshrc /home/${USERNAME}/.zshrc
+
+# conda init zsh appends its own managed block, so the activate line goes on
+# last — otherwise conda's block would land after the activation and the base
+# env would not be on PATH in an interactive shell.
+RUN set -eux; \
+    "${CONDA_DIR}/bin/conda" init zsh; \
+    echo '. /opt/conda/etc/profile.d/conda.sh && conda activate base' \
+    >> "$HOME/.zshrc"
 
 # ---------------------------------------------------------------------------
 # Back to root for the pieces the entrypoint needs

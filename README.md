@@ -779,7 +779,7 @@ The rest of that config still loads normally; only the one line is dropped.
 
 ## What's in the image
 
-Debian bookworm, Miniforge, Python 3.12. **2.23 GB.**
+Debian bookworm, Miniforge, Python 3.12. **2.25 GB.**
 
 Miniforge rather than Miniconda because it defaults to the community-run
 **conda-forge** channel. Anaconda's own `defaults` channel is covered by
@@ -791,12 +791,41 @@ The default build, by where each package comes from:
 
 | Source | Packages |
 | --- | --- |
-| apt | `git` · `git-lfs` · `tmux` · `htop` · `jq` · `ripgrep` · `fd-find` · `rsync` · `build-essential` · `openssh-server` · `sudo` |
+| apt | `git` · `git-lfs` · `zsh` · `tmux` · `htop` · `jq` · `ripgrep` · `fd-find` · `rsync` · `build-essential` · `openssh-server` · `sudo` |
 | conda-forge | `python` · `numpy` · `scipy` · `pandas` · `matplotlib-base` · `ipython` · `nodejs` |
 | pip | `jax[cpu]` · `marimo` · `tqdm` · `rich` · `httpx` · `uv` . `gomp`|
 | bundled | `conda` / `mamba` (from the Miniforge installer) |
 
 `fd-find` installs its binary as **`fdfind`** on Debian, not `fd`.
+
+### The shell
+
+The box user's login shell is **zsh**, so `boxy ssh` lands in it, with the
+`crunch` prompt — time, working directory, git branch and a clean/dirty mark:
+
+```
+(base) {14:22} /work:boxy/web ✓ $
+```
+
+There is no oh-my-zsh. The theme needs three things from it — a colour table,
+`git_prompt_info` and `ruby_prompt_info` — and `docker/zshrc` defines them in a
+dozen lines instead of carrying a framework clone in the image. That also fixes
+a real failure: oh-my-zsh's `git_prompt_info` is asynchronous, filled in by a
+`precmd` worker through `zle -F`, and in a box driven over SSH by a script that
+worker frequently never delivers, so the branch simply never appears. The
+version here is synchronous. The theme file itself is unmodified, so it stays
+interchangeable with the same theme on a normal oh-my-zsh machine.
+
+Bash is still installed and still fully configured, and **`boxy exec` uses
+`bash -l` deliberately** — a broken zsh startup file cannot lock you out.
+
+One wrinkle matters if you edit the image. Debian's `/etc/zsh/zprofile` is
+comments only; it never sources `/etc/profile`, so a zsh login shell sees
+nothing in `/etc/profile.d`. `PATH` and the proxy arrive regardless, because
+`sshd`'s pam_env reads `/etc/environment` — but `cd /work` and the `boxy env`
+loader would not. The entrypoint writes those into `~/.zshenv`, which zsh reads
+on *every* invocation, so one file covers both an interactive `ssh box` and a
+non-interactive `ssh box cmd`. Bash needs two files for the same job.
 
 Opt-in, because they are large and not everyone wants them in every box:
 

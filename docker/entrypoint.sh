@@ -294,6 +294,36 @@ if ! grep -q '^# >>> boxy >>>' "$BASHRC" 2>/dev/null; then
     rm -f "$boxy_tmp"
 fi
 
+# The same job for zsh, which is the box user's login shell.
+#
+# One file covers what bash needed two for: zsh reads ~/.zshenv on EVERY
+# invocation, so both an interactive `ssh box` and a non-interactive
+# `ssh box cmd` go through here.
+#
+# It has to source profile.d by hand. Debian's /etc/zsh/zprofile is comments
+# only — it does not source /etc/profile the way the bash side does — so
+# without this a zsh login shell would get no `cd /work` and no `boxy env`.
+# `emulate sh` because those files are sh, and zsh's default word splitting
+# would otherwise change what they mean.
+#
+# Unlike .bashrc this file does not exist yet (useradd's skeleton has no
+# .zshenv), so it is created as the user rather than written as root.
+ZSHENV="$USER_HOME/.zshenv"
+if ! grep -q '^# >>> boxy >>>' "$ZSHENV" 2>/dev/null; then
+    boxy_tmp="$(mktemp)"
+    {
+        printf '# >>> boxy >>>\n'
+        printf 'for _boxy_f in /etc/profile.d/*.sh; do\n'
+        printf '    [ -r "$_boxy_f" ] && emulate sh -c "source $_boxy_f"\n'
+        printf 'done\n'
+        printf 'unset _boxy_f\n'
+        printf '# <<< boxy <<<\n'
+        cat "$ZSHENV" 2>/dev/null || true
+    } > "$boxy_tmp"
+    as_user tee "$ZSHENV" < "$boxy_tmp" >/dev/null
+    rm -f "$boxy_tmp"
+fi
+
 # ---------------------------------------------------------------------------
 # 8. MOTD + hand off to sshd
 # ---------------------------------------------------------------------------

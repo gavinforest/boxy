@@ -1,0 +1,39 @@
+# Managed by boxy. Interactive zsh setup for the box user.
+#
+# There is no oh-my-zsh here. The crunch theme needs exactly three things from
+# it — a colour table, `git_prompt_info` and `ruby_prompt_info` — and those are
+# a dozen lines, against a framework clone that has to be kept in the image and
+# updated. Defining them directly also fixes a real problem: oh-my-zsh's
+# `git_prompt_info` is asynchronous, filled in by a `precmd` worker through
+# `zle -F`, and in a box driven over SSH by a script that worker often never
+# delivers, so the branch silently never appears.
+#
+# The theme file itself is unmodified, so it stays interchangeable with the
+# same theme on a normal oh-my-zsh machine.
+
+autoload -Uz colors && colors
+setopt prompt_subst
+
+# The theme supplies ZSH_THEME_GIT_PROMPT_{PREFIX,SUFFIX,CLEAN,DIRTY}; this
+# only assembles them. Detached HEAD falls back to a short SHA rather than
+# printing nothing, which is the state a `boxy create worktree --ref <tag>` box
+# starts in.
+git_prompt_info() {
+    local ref dirty
+    ref=$(command git symbolic-ref --short HEAD 2>/dev/null) \
+        || ref=$(command git rev-parse --short HEAD 2>/dev/null) \
+        || return 0
+    if [[ -n $(command git status --porcelain 2>/dev/null) ]]; then
+        dirty=$ZSH_THEME_GIT_PROMPT_DIRTY
+    else
+        dirty=$ZSH_THEME_GIT_PROMPT_CLEAN
+    fi
+    print -n -- "${ZSH_THEME_GIT_PROMPT_PREFIX}${ref}${dirty}${ZSH_THEME_GIT_PROMPT_SUFFIX}"
+}
+
+# The theme prints an RVM segment. No ruby ships in the box, so this is the
+# empty stub oh-my-zsh would supply — present only so the theme's
+# $(ruby_prompt_info) does not expand to a "command not found".
+ruby_prompt_info() { : }
+
+source /etc/zsh/crunch-custom.zsh-theme

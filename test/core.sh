@@ -26,6 +26,45 @@ assert_eq "login shell also lands in /work"      "/work" \
     "$(bssh boxy-1 'bash -lc pwd')"
 assert_eq "uv present" "/opt/conda/bin/uv" "$(bssh boxy-1 'command -v uv')"
 
+section "the login shell is zsh"
+assert_eq "the box user's login shell" "/usr/bin/zsh" \
+    "$(bssh boxy-1 'getent passwd boxyboy | cut -d: -f7')"
+assert_eq "an ssh command runs under zsh, not bash" "zsh" \
+    "$(bssh boxy-1 'echo ${ZSH_VERSION:+zsh}${BASH_VERSION:+bash}')"
+# Debian's /etc/zsh/zprofile is comments only — it never sources /etc/profile —
+# so a zsh login shell sees nothing in /etc/profile.d. The entrypoint's
+# ~/.zshenv block is what puts `cd /work` and the `boxy env` loader back, and
+# because zsh reads .zshenv on EVERY invocation it covers the interactive and
+# the `ssh box cmd` case in one file. The "lands in /work" assertion above is
+# the one that would fail if this block went missing.
+assert_contains "the boxy block sources profile.d from .zshenv" "profile.d" \
+    "$(docker exec boxy-1 cat /home/boxyboy/.zshenv)"
+# bash stays fully configured on purpose: `boxy exec` uses `bash -l`, so a
+# broken zsh startup file cannot lock you out of the box.
+assert_eq "bash is still a working way in" "/opt/conda/bin/python" \
+    "$(bssh boxy-1 'bash -lc "command -v python"')"
+
+section "the prompt"
+# The theme's helpers are defined in docker/zshrc rather than pulled in with
+# oh-my-zsh, whose git_prompt_info is asynchronous — filled by a precmd worker
+# through `zle -F` — and delivers nothing to a session driven by a script.
+# These assertions only pass against a synchronous implementation.
+assert_contains "the theme is installed" "CRUNCH" \
+    "$(docker exec boxy-1 head -1 /etc/zsh/crunch-custom.zsh-theme)"
+bssh boxy-1 'mkdir -p /work/pt && cd /work/pt && git -c init.defaultBranch=main init -q . \
+    && git config user.email t@t && git config user.name t \
+    && echo x > f && git add -A && git commit -qm c' >/dev/null
+assert_contains "git_prompt_info names the branch" "main" \
+    "$(bssh boxy-1 'zsh -ic "cd /work/pt && git_prompt_info"')"
+assert_contains "a clean tree is marked clean" "✓" \
+    "$(bssh boxy-1 'zsh -ic "cd /work/pt && git_prompt_info"')"
+assert_contains "a dirty tree is marked dirty" "✗" \
+    "$(bssh boxy-1 'echo y >> /work/pt/f; zsh -ic "cd /work/pt && git_prompt_info"')"
+# The theme prints an RVM segment and no ruby ships in the box. Without the
+# stub, every prompt draw would expand to a "command not found".
+assert_eq "ruby_prompt_info is stubbed, not missing" "" \
+    "$(bssh boxy-1 'zsh -ic "ruby_prompt_info"')"
+
 section "the scientific stack"
 assert_contains "numpy/scipy/jax import and compute" "jax-ok" \
     "$(bssh boxy-1 'python -c "
