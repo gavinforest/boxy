@@ -109,11 +109,20 @@ assert_eq "unprivileged low-port bind still works" "works" \
 assert_contains "sudo still reaches uid 0" "uid=0(root)" \
     "$(bssh boxy-1 "echo '$PW' | sudo -S -k id")"
 
-section "--caps default is an escape hatch"
-boxy create -n plaincaps --caps default >/dev/null 2>&1
+section "--caps docker-default is an escape hatch"
+boxy create -n plaincaps --caps docker-default >/dev/null 2>&1
 assert_contains "restores the full docker set" "cap_mknod" "$(caps_of plaincaps)"
 assert_contains "a bad value is rejected" "--caps must be one of" \
     "$(boxy create -n bogus --caps nonsense 2>&1)"
+# `default` was the old spelling and is still accepted, silently, so existing
+# configs keep working. It normalises so the label never shows the old name.
+boxy rm plaincaps >/dev/null 2>&1
+boxy create -n oldcaps --caps default >/dev/null 2>&1
+assert_eq "the old 'default' spelling still works" "docker-default" \
+    "$(boxy info oldcaps | awk '/^caps/{print $2}')"
+assert_contains "and grants the same set" "cap_mknod" "$(caps_of oldcaps)"
+boxy rm oldcaps >/dev/null 2>&1
+boxy create -n plaincaps --caps docker-default >/dev/null 2>&1
 # Release the instance slot again so the port assertion below still describes
 # "the second box", not "the fourth".
 boxy rm plaincaps >/dev/null 2>&1

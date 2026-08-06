@@ -520,27 +520,26 @@ usage: boxy create [TARGET] [options]
 
 TARGET determines host directory to be mounted as /work:
 
-  .  or PATH    TARGET -> /work                        boxy create .
-  worktree      make a git worktree of current dir     boxy create worktree
-                on host -> /work
-  (omitted)     new scratch dir in $TMPDIR -> /work    boxy create
+  .  or PATH    TARGET -> /work                    boxy create .
+  worktree      a git worktree of the current repo  boxy create worktree
+  (omitted)     new scratch dir in $TMPDIR          boxy create
 
 Worktree gets a new branch (boxy/NAME) and shares history with your
 repo, so commits made in the box are viewable in your repo.
 Your main checkout is not mounted and cannot be touched.
 
 options:
-  -b, --ref REF         commit-ish the worktree branches from (default: HEAD)
+  -b, --ref REF         commit-ish the worktree branches from (def: HEAD)
   -n, --name NAME       instance name (default: boxy-N)
-      --password PASS   sudo password (default: random EFF-wordlist passphrase)
+      --password PASS   sudo password (default: random EFF passphrase)
   -u, --user NAME       login user inside the box (default: boxyboy)
-  -k, --key PATH        public key to authorize (default: $BOXY_SSH_KEY.pub)
-      --net MODE        full | none | limited          (default: full)
-      --caps MODE       minimal | default capability set (default: minimal)
-      --allow DOMAIN    extra allowed domain for --net limited (repeatable)
+  -k, --key PATH        public key to authorize (def: $BOXY_SSH_KEY.pub)
+      --net MODE        full | none | limited        (default: full)
+      --caps MODE       minimal | docker-default     (default: minimal)
+      --allow DOMAIN    extra allowed domain for --net limited (repeats)
   -p, --publish SPEC    publish a port, docker-style (repeatable):
-                          -p 2718        -> localhost:2718 -> container 2718
-                          -p 12718:2718  -> localhost:12718 -> container 2718
+                          -p 2718       -> localhost:2718 -> box 2718
+                          -p 12718:2718 -> localhost:12718 -> box 2718
                         Default is none; use `boxy forward` instead.
       --image IMG       image to run (default: boxy:latest)
       --cpus N          CPU limit
@@ -551,12 +550,13 @@ Anything after `--` is passed to `docker run` unchanged, for example:
   boxy create . -- -v ~/data:/data
   boxy create . -- --gpus all --shm-size 2g
 
-These are after boxy's own flags, so whenever docker takes the last value
-of a repeated flag (most of the time), manual ones win. Two exceptions:
+These land after boxy's own flags. Where docker takes the last value of
+a repeated flag (--cpus, --memory) yours wins; where it accumulates
+(-v, -e, --cap-add) yours is added to boxy's. Two caveats:
 
-  --network   boxy's to set; use --net full|none|limited instead
-  -e K=V      reaches the box's processes and `boxy exec`, but NOT `boxy ssh`
-              sessions (gets environment from PAM). Use `boxy env` instead.
+  --network  boxy's to set; use --net full|none|limited instead
+  -e K=V     reaches the box's own processes and `boxy exec`, but NOT
+             `boxy ssh`, which gets its env from PAM. Use `boxy env`.
 EOF
 }
 
@@ -662,9 +662,14 @@ create_validate() {
         full|none|limited) ;;
         *) die "--net must be one of: full, none, limited" ;;
     esac
+    # `default` is the old spelling of `docker-default`. It was a bad name: it
+    # meant "Docker's default set", but boxy's default is `minimal`, so the
+    # value named `default` was the one you never got by default. Still
+    # accepted, silently, so existing configs and scripts keep working.
+    [ "$NB_CAPS" = "default" ] && NB_CAPS="docker-default"
     case "$NB_CAPS" in
-        minimal|default) ;;
-        *) die "--caps must be one of: minimal, default" ;;
+        minimal|docker-default) ;;
+        *) die "--caps must be one of: minimal, docker-default" ;;
     esac
 
     # The passthrough is deliberately unpoliced except here. The network is the
@@ -1002,7 +1007,7 @@ create_assemble_run_args() {
     [ -n "$NB_CPUS" ]   && arg --cpus "$NB_CPUS"
     [ -n "$NB_MEMORY" ] && arg --memory "$NB_MEMORY"
 
-    # Capability policy. `default` leaves Docker's own set alone.
+    # Capability policy. `docker-default` leaves Docker's own set alone.
     if [ "$NB_CAPS" = "minimal" ]; then
         arg --cap-drop=ALL
         local cap

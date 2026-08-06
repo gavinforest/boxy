@@ -40,7 +40,11 @@
 
 # --- container privileges --------------------------------------------------
 
-# Capability policy: minimal | default.
+# Capability policy: minimal | docker-default.
+#
+# Note which is which: `minimal` is boxy's default, and `docker-default` means
+# Docker's own set. (`default` is still accepted as an alias for
+# `docker-default`, but the name read backwards and should not be used.)
 #
 # `minimal` drops the four Linux capabilities nothing in a dev box legitimately
 # needs — MKNOD (device nodes), SETPCAP and SETFCAP (capability manipulation),
@@ -63,8 +67,8 @@
 #   AUDIT_WRITE       PAM writes login records with it.
 #
 # If something in a box ever fails in a way that smells like a missing
-# privilege, `boxy create --caps default` restores Docker's full set and is the
-# fastest way to confirm or rule it out.
+# privilege, `boxy create --caps docker-default` restores Docker's full set and
+# is the fastest way to confirm or rule it out.
 #BOXY_CAPS=minimal
 
 # The exact set granted under `minimal`. Add to it rather than switching to
