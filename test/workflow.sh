@@ -263,6 +263,30 @@ assert_contains "a non-identifier is refused" "must be identifiers" \
     "$(boxy env envb 9bad=x 2>&1)"
 purge_all
 
+section "/etc/environment is rewritten, not truncated"
+# The entrypoint runs on every start. It used to write the file with `>`, which
+# was idempotent but silently discarded anything you had put there by hand the
+# first time the box came back.
+boxy create -n envkeep >/dev/null 2>&1
+docker exec -u root envkeep sh -c "printf 'MY_OWN=survives\n' >> /etc/environment"
+boxy stop envkeep >/dev/null 2>&1; boxy start envkeep >/dev/null 2>&1
+assert_eq "a hand-added line survives a restart" "survives" \
+    "$(bssh envkeep 'echo $MY_OWN')"
+assert_eq "and boxy's own block is still applied" "envkeep" \
+    "$(bssh envkeep 'echo $BOXY_NAME')"
+assert_eq "with exactly one boxy block" "1" \
+    "$(docker exec envkeep grep -c '>>> boxy >>>' /etc/environment)"
+# A key set on both sides would leave pam_env to choose; boxy's has to win.
+docker exec -u root envkeep sh -c "printf 'PATH=/hijacked\n' >> /etc/environment"
+boxy stop envkeep >/dev/null 2>&1; boxy start envkeep >/dev/null 2>&1
+assert_eq "a conflicting key appears once" "1" \
+    "$(docker exec envkeep grep -c '^PATH=' /etc/environment)"
+assert_eq "and boxy's value is the one in force" "/opt/conda/bin" \
+    "$(bssh envkeep 'echo ${PATH%%:*}')"
+assert_eq "unrelated hand edits are still kept" "survives" \
+    "$(bssh envkeep 'echo $MY_OWN')"
+boxy rm envkeep >/dev/null 2>&1
+
 section "config --init installs a config you point it at"
 # The argument is the SOURCE; the destination is always the path boxy reads.
 # Writing to an arbitrary destination would produce a file boxy ignores.

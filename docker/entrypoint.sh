@@ -116,11 +116,57 @@ fi
 # NON-interactive SSH commands (`ssh box python ...`). Those shells read
 # neither /etc/profile nor ~/.bashrc, so anything set only in profile.d would
 # be invisible to exactly the case an agent driving the box hits most.
+#
+# Rewritten in place, not truncated. This entrypoint runs on EVERY start, and
+# `>` was the lazy route to staying idempotent across restarts — it also threw
+# away anything you had added to the file by hand, silently, the first time the
+# box came back. Only the block between the markers belongs to boxy.
+BOXY_ENV_FILE=/etc/environment
+BOXY_ENV_BEGIN='# >>> boxy >>>'
+BOXY_ENV_END='# <<< boxy <<<'
+
+# Managed KEY=VALUE lines arrive on stdin.
+write_boxy_environment() {
+    local managed keys tmp
+    managed="$(cat)"
+    keys="$(printf '%s\n' "$managed" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')"
+    tmp="$(mktemp)"
+    # Keep everything outside the block, minus any key we are about to set:
+    # the same key on two lines would leave pam_env to pick between them, and
+    # boxy's value has to be the one that lands.
+    awk -v b="$BOXY_ENV_BEGIN" -v e="$BOXY_ENV_END" -v keys="$keys" '
+        BEGIN { n = split(keys, k, "\n"); for (i = 1; i <= n; i++) if (k[i] != "") drop[k[i]] = 1 }
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        skip    { next }
+        { key = $0; sub(/=.*/, "", key); if (key in drop) next; print }
+    ' "$BOXY_ENV_FILE" 2>/dev/null > "$tmp" || true
+    {
+        cat "$tmp"
+        printf '%s\n' "$BOXY_ENV_BEGIN"
+        printf '%s\n' "$managed"
+        printf '%s\n' "$BOXY_ENV_END"
+    } > "$BOXY_ENV_FILE"
+    rm -f "$tmp"
+    chmod 644 "$BOXY_ENV_FILE"
+}
+
+# One write, so the block is assembled once rather than replaced and appended
+# to — a second call would strip what the first had just put inside the markers.
+NO_PROXY_LIST="localhost,127.0.0.1,::1,.local"
 {
     printf 'PATH=%s/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n' "$CONDA_DIR"
     printf 'LANG=C.UTF-8\n'
     printf 'BOXY_NAME=%s\n' "$BOXY_NAME"
-} > /etc/environment
+    if [[ -n "${BOXY_PROXY_URL:-}" ]]; then
+        printf 'http_proxy=%s\n'  "$BOXY_PROXY_URL"
+        printf 'https_proxy=%s\n' "$BOXY_PROXY_URL"
+        printf 'HTTP_PROXY=%s\n'  "$BOXY_PROXY_URL"
+        printf 'HTTPS_PROXY=%s\n' "$BOXY_PROXY_URL"
+        printf 'no_proxy=%s\n'    "$NO_PROXY_LIST"
+        printf 'NO_PROXY=%s\n'    "$NO_PROXY_LIST"
+    fi
+} | write_boxy_environment
 
 # ...and a second time for LOGIN shells, which pam_env does not cover.
 # Debian's /etc/profile hard-assigns PATH (it does not append), so a login
@@ -139,15 +185,7 @@ chmod 644 /etc/profile.d/00-boxy-path.sh
 
 if [[ -n "${BOXY_PROXY_URL:-}" ]]; then
     log "egress restricted via proxy $BOXY_PROXY_URL"
-    NO_PROXY_LIST="localhost,127.0.0.1,::1,.local"
-    {
-        printf 'http_proxy=%s\n'  "$BOXY_PROXY_URL"
-        printf 'https_proxy=%s\n' "$BOXY_PROXY_URL"
-        printf 'HTTP_PROXY=%s\n'  "$BOXY_PROXY_URL"
-        printf 'HTTPS_PROXY=%s\n' "$BOXY_PROXY_URL"
-        printf 'no_proxy=%s\n'    "$NO_PROXY_LIST"
-        printf 'NO_PROXY=%s\n'    "$NO_PROXY_LIST"
-    } >> /etc/environment
+    # The pam_env half of this went into the managed block above.
     cat > /etc/profile.d/boxy-proxy.sh <<EOF
 export http_proxy="$BOXY_PROXY_URL" https_proxy="$BOXY_PROXY_URL"
 export HTTP_PROXY="$BOXY_PROXY_URL" HTTPS_PROXY="$BOXY_PROXY_URL"
