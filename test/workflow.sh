@@ -263,6 +263,46 @@ assert_contains "a non-identifier is refused" "must be identifiers" \
     "$(boxy env envb 9bad=x 2>&1)"
 purge_all
 
+section "config --init installs a config you point it at"
+# The argument is the SOURCE; the destination is always the path boxy reads.
+# Writing to an arbitrary destination would produce a file boxy ignores.
+# The old failure mode was worse still: the positional was dropped entirely,
+# so --init wrote the default path and reported success naming neither.
+CFG="$TEST_TMP/cfg"
+rm -rf "$CFG"; mkdir -p "$CFG"
+printf '# template\nBOXY_USER=teamuser\n' > "$CFG/team.conf"
+# Note BOXY_CONFIG_FILE, not BOXY_CONFIG_DIR: the file setting wins outright
+# where both are set, which is exactly what lib.sh does to every suite.
+out="$(BOXY_CONFIG_FILE="$CFG/active/config" boxy config --init "$CFG/team.conf" 2>&1)"
+assert_eq "it lands at the active config path" "yes" \
+    "$( [ -f "$CFG/active/config" ] && echo yes || echo no )"
+assert_contains "and names where it went" "$CFG/active/config" "$out"
+assert_contains "and where it came from" "$CFG/team.conf" "$out"
+# The point of installing to the active path: no extra step to make it count.
+assert_contains "the imported settings are immediately in effect" "teamuser" \
+    "$(BOXY_CONFIG_FILE="$CFG/active/config" boxy config)"
+# dirname of the DESTINATION had to be created here; the old code created
+# BOXY_CONFIG_DIR instead and died with a bare `cp:` error.
+assert_eq "no source means the bundled example" "same" \
+    "$(BOXY_CONFIG_FILE="$CFG/plain/config" boxy config --init >/dev/null 2>&1; \
+       diff -q "$CFG/plain/config" ./boxy.conf.example >/dev/null && echo same || echo differs)"
+assert_contains "an existing config is never overwritten" "already exists" \
+    "$(BOXY_CONFIG_FILE="$CFG/plain/config" boxy config --init 2>&1)"
+
+section "config rejects what it cannot act on"
+assert_contains "a missing source" "no such file" \
+    "$(BOXY_CONFIG_FILE="$CFG/x/config" boxy config --init "$CFG/nope.conf" 2>&1)"
+assert_empty "and creates no destination when the source is bad" \
+    "$(ls "$CFG/x/config" 2>/dev/null)"
+assert_contains "unknown option" "unknown option" "$(boxy config --bogus 2>&1)"
+assert_contains "stray argument without --init" "unexpected argument" \
+    "$(boxy config stray 2>&1)"
+assert_contains "two sources" "one source at a time" \
+    "$(BOXY_CONFIG_FILE="$CFG/y/config" boxy config --init a.conf b.conf 2>&1)"
+assert_contains "--help is help, not the settings dump" "usage: boxy config" \
+    "$(boxy config --help 2>&1)"
+rm -rf "$CFG"
+
 section "create validates before doing work"
 assert_contains "a bad path is caught up front" "not a directory" \
     "$(boxy create /nope/nothing 2>&1)"

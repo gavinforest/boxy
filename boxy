@@ -1814,15 +1814,59 @@ cmd_doctor() {
     ok "looks healthy"
 }
 
+# `--init [FROM]` installs a config file at the path boxy actually reads.
+#
+# The argument is the SOURCE, not the destination. Writing to an arbitrary
+# destination would produce a config boxy ignores unless you also set
+# BOXY_CONFIG_FILE — a result that needs a footnote to be useful. Installing
+# to the active path instead means the file is in effect the moment it lands,
+# and BOXY_CONFIG_FILE still chooses where "active" is.
 cmd_config() {
-    if [ "${1:-}" = "--init" ]; then
-        mkdir -p "$BOXY_CONFIG_DIR"
-        [ -f "$BOXY_CONFIG_FILE" ] && die "$BOXY_CONFIG_FILE already exists"
-        cp "$SELF_DIR/boxy.conf.example" "$BOXY_CONFIG_FILE"
+    local action="show" source=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --init) action="init"; shift ;;
+            -h|--help)
+                printf 'usage: boxy config [--init [FROM]]\n'
+                printf '  (no arguments)  show the effective configuration\n'
+                printf '  --init          install the bundled example as your config\n'
+                printf '  --init FROM     install FROM as your config instead\n\n'
+                printf 'installs to: %s\n' "$BOXY_CONFIG_FILE"
+                printf 'set BOXY_CONFIG_FILE to install somewhere else.\n'
+                return 0 ;;
+            -*) die "config: unknown option $1 (try 'boxy config --help')" ;;
+            *)
+                # Silently ignoring this used to be the failure mode: a
+                # positional was dropped and `--init` reported success naming
+                # a file the caller never mentioned.
+                [ "$action" = "init" ] \
+                    || die "config: unexpected argument '$1' (try 'boxy config --help')"
+                [ -z "$source" ] \
+                    || die "config: one source at a time (got '$source' and '$1')"
+                source="$1"; shift ;;
+        esac
+    done
+
+    if [ "$action" = "init" ]; then
+        [ -n "$source" ] || source="$SELF_DIR/boxy.conf.example"
+        [ -f "$source" ] || die "config: no such file: $source"
+        [ -r "$source" ] || die "config: cannot read $source"
+        if [ -f "$BOXY_CONFIG_FILE" ]; then
+            die "$BOXY_CONFIG_FILE already exists — move it aside first"
+        fi
+        # dirname of the destination, not BOXY_CONFIG_DIR. They differ whenever
+        # BOXY_CONFIG_FILE is set on its own, and the old code created the wrong
+        # directory and then failed with a bare `cp:` error.
+        mkdir -p "$(dirname "$BOXY_CONFIG_FILE")" \
+            || die "config: cannot create $(dirname "$BOXY_CONFIG_FILE")"
+        cp "$source" "$BOXY_CONFIG_FILE" \
+            || die "config: could not write $BOXY_CONFIG_FILE"
         ensure_allowlist
         ok "wrote $BOXY_CONFIG_FILE"
+        [ "$source" = "$SELF_DIR/boxy.conf.example" ] || note "copied from $source"
         return 0
     fi
+
     printf 'config file  %s%s\n' "$BOXY_CONFIG_FILE" \
         "$( [ -f "$BOXY_CONFIG_FILE" ] || printf ' (not present; boxy config --init)' )"
     local k

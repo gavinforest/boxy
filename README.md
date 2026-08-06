@@ -94,7 +94,7 @@ trust-on-first-use prompt, and no `StrictHostKeyChecking=no`.
 | `boxy ssh-config [--install]` | Emit / install an `ssh_config` covering every box     |
 | `boxy build [--full]`         | Build the images                                      |
 | `boxy doctor [--verbose]`     | Check the local setup; `-v` adds `boxy info` per box  |
-| `boxy config [--init]`        | Show or scaffold configuration                        |
+| `boxy config [--init [FROM]]` | Show the effective config, or install one             |
 
 **Docker passthroughs** — thin wrappers that resolve the box name, add boxy's
 defaults, and hand off to Docker. Added for convenience of use. If you prefer, run the bracketed command yourself; the
@@ -575,6 +575,52 @@ Most-used knobs:
 | `BOXY_PORTS`     | `2718 8888 8000 8080 3000 5000 6006` | what `boxy forward` tunnels when you name no ports |
 | `BOXY_BIND_ADDR` | `127.0.0.1`                          | interface for published ports                   |
 | `BOXY_NET`       | `full`                               | default egress policy                           |
+
+### Installing a config
+
+```bash
+boxy config                            # show the effective configuration
+boxy config --init                     # install the bundled example
+boxy config --init ~/team/boxy.conf    # install that file instead
+```
+
+`--init` takes the file to install **from**; it always writes to the path boxy
+actually reads, so an imported config is in effect immediately. That is the
+point of the argument being a source rather than a destination — a config
+written somewhere boxy does not look would need a second step to matter.
+
+It never overwrites an existing config: move the old one aside first.
+
+### Putting the config somewhere else
+
+The config path is not fixed. Two variables set it, and like everything else
+they can come from the environment:
+
+| Variable            | Default                | |
+| ------------------- | ---------------------- | --- |
+| `BOXY_CONFIG_DIR`   | `~/.config/boxy`       | holds the config and `allowlist.txt` |
+| `BOXY_CONFIG_FILE`  | `$BOXY_CONFIG_DIR/config` | the config file itself |
+
+`BOXY_CONFIG_FILE` wins outright where both are set — it is only *derived* from
+`BOXY_CONFIG_DIR` when you have not set it yourself. So setting the directory
+moves both files, while setting the file moves only the config:
+
+```bash
+BOXY_CONFIG_DIR=~/work/boxy boxy ls          # config and allowlist both move
+BOXY_CONFIG_FILE=~/work.conf boxy ls         # only the config moves
+```
+
+This composes with `--init`, which is how you keep more than one setup around:
+
+```bash
+BOXY_CONFIG_FILE=~/work.conf boxy config --init ~/team/boxy.conf
+BOXY_CONFIG_FILE=~/work.conf boxy create .
+```
+
+One wrinkle worth knowing: the allowlist is always
+`$BOXY_CONFIG_DIR/allowlist.txt`, so a config relocated with `BOXY_CONFIG_FILE`
+alone still shares the default directory's allowlist. Set `BOXY_CONFIG_DIR` if
+you want the pair to travel together.
 
 ---
 
