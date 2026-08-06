@@ -42,6 +42,26 @@ sleep 1
 assert_eq "tunnel is gone after --stop" "000" \
     "$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8000/ 2>/dev/null)"
 
+# --stop used to kill whatever the recorded pid now referred to. The pidfile
+# outlives a tunnel that died on its own, and pids get recycled, so that could
+# signal an unrelated process of yours. It has to confirm the pid is still the
+# tunnel — identified by ExitOnForwardFailure plus the box name — before
+# signalling anything.
+FWD_PIDFILE="$BOXY_STATE_DIR/instances/boxy-1/forward.pid"
+sleep 300 & FWD_INNOCENT=$!
+printf '%s\n' "$FWD_INNOCENT" > "$FWD_PIDFILE"
+assert_contains "a recycled pid is not signalled" "stale record" \
+    "$(boxy forward boxy-1 --stop 2>&1)"
+assert_eq "and the unrelated process is still alive" "alive" \
+    "$(ps -p "$FWD_INNOCENT" >/dev/null 2>&1 && echo alive || echo killed)"
+kill "$FWD_INNOCENT" 2>/dev/null; wait "$FWD_INNOCENT" 2>/dev/null
+assert_empty "the stale record is cleared either way" \
+    "$(ls "$FWD_PIDFILE" 2>/dev/null)"
+assert_contains "a garbage pidfile is handled, not fed to kill" "stale record" \
+    "$(printf 'not-a-pid\n' > "$FWD_PIDFILE"; boxy forward boxy-1 --stop 2>&1)"
+assert_contains "and no record at all is an honest error" "no background tunnel" \
+    "$(boxy forward boxy-1 --stop 2>&1)"
+
 section "boxy create worktree"
 # A worktree's .git is a file naming an absolute host path, so the box only
 # gets a working repo because boxy also mounts the shared git dir at that

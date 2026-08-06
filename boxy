@@ -1940,6 +1940,38 @@ cmd_exec() {
     exec docker exec $tty_args -u "$user" -e "HOME=$home" -w /work "$name" bash -lc "$*"
 }
 
+# Is this pid still the tunnel we recorded, or has the number moved on?
+#
+# `boxy forward --bg` writes the ssh client's pid to a file, and that file
+# outlives the process whenever the tunnel dies on its own — a dropped network,
+# ExitOnForwardFailure, a reboot. PIDs are recycled, so by the time you run
+# `--stop` the number can belong to something else of yours, and killing it
+# blind signals a stranger. Low odds, but nothing about `--stop` says "and
+# possibly one unrelated process".
+#
+# The tunnel is a HOST process — boxy's own ssh child — so this is a plain `ps`
+# and never enters a container. It works with the box stopped and even with its
+# sidecar gone.
+#
+# Identified by two things that together no other process of yours will have:
+# the ExitOnForwardFailure option boxy always passes, and the box name, which
+# is the final argument. A recycled pid owned by another user fails the check
+# too, since its command line will not match.
+forward_pid_is_tunnel() {
+    local pid="$1" name="$2" cmd
+    printf '%s' "$pid" | grep -qE '^[0-9]+$' || return 1
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+    [ -n "$cmd" ] || return 1
+    case "$cmd" in
+        *ExitOnForwardFailure*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *" $name") return 0 ;;
+    esac
+    return 1
+}
+
 cmd_forward() {
     require_docker
     local name="" bg=0 stop=0 want_ports=""
@@ -1966,9 +1998,16 @@ cmd_forward() {
 
     if [ "$stop" = "1" ]; then
         [ -f "$pidfile" ] || die "no background tunnel recorded for $name"
-        kill "$(cat "$pidfile")" 2>/dev/null || true
-        rm -f "$pidfile"
-        ok "stopped tunnel for $name"
+        local pid; pid="$(cat "$pidfile" 2>/dev/null || true)"
+        if forward_pid_is_tunnel "$pid" "$name"; then
+            kill "$pid" 2>/dev/null || true
+            rm -f "$pidfile"
+            ok "stopped tunnel for $name"
+        else
+            # Nothing was signalled: see forward_pid_is_tunnel.
+            rm -f "$pidfile"
+            note "no tunnel running for $name — cleared a stale record (pid ${pid:-none})"
+        fi
         return 0
     fi
 

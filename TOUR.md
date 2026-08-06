@@ -435,6 +435,17 @@ $ boxy forward boxy-1 --stop
 stopped tunnel for boxy-1
 ```
 
+`--bg` records the ssh client's pid, and `--stop` checks that the pid is still
+that tunnel before signalling it. Worth doing because the record outlives a
+tunnel that died on its own — a dropped network, `ExitOnForwardFailure`, a
+reboot — and pids get recycled, so a blind `kill` could land on something else
+of yours. A tunnel that is already gone says so instead:
+
+```
+$ boxy forward boxy-1 --stop
+no tunnel running for boxy-1 — cleared a stale record (pid 59360)
+```
+
 **`-p`** publishes, with exactly docker's semantics — a bare port means the
 same number, `HOST:CONTAINER` states it explicitly:
 

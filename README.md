@@ -87,7 +87,7 @@ trust-on-first-use prompt, and no `StrictHostKeyChecking=no`.
 | ----------------------------- | ----------------------------------------------------- |
 | `boxy create [options]`       | Create and start a box (see below)                    |
 | `boxy ssh [NAME] [-- CMD]`    | Interactive session, or one command with `--`         |
-| `boxy forward [NAME] [PORTS]` | Tunnel box ports to the _same_ localhost numbers      |
+| `boxy forward [NAME] [PORTS]` | Tunnel box ports to the _same_ localhost numbers; `--bg` / `--stop` to run it in the background |
 | `boxy rm NAME...`             | Remove a box; never touches your files                |
 | `boxy ls`                     | List boxes with status, SSH port, net mode, workdir   |
 | `boxy info [NAME]`            | One box in detail, config and actual state            |
