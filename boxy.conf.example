@@ -3,6 +3,11 @@
 # This file is sourced by bash, so it is shell syntax. Anything you leave
 # commented keeps its built-in default. Environment variables you export
 # before running boxy win over this file; command-line flags win over both.
+#
+# One variable cannot be set here: BOXY_CONFIG_DIR, which names the directory
+# this file lives in (alongside allowlist.txt). By the time this file is read
+# it has already been used to find it, so boxy warns and ignores it. Export it
+# instead:  BOXY_CONFIG_DIR=~/work/boxy boxy create .
 
 # --- identity -------------------------------------------------------------
 

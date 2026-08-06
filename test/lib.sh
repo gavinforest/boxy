@@ -10,7 +10,6 @@ BOXY="$BOXY_ROOT/boxy"
 TEST_TMP="${TEST_TMP:-${TMPDIR:-/tmp}/boxy-test.$$}"
 export BOXY_STATE_DIR="$TEST_TMP/state"
 export BOXY_CONFIG_DIR="$TEST_TMP/config"
-export BOXY_CONFIG_FILE="$TEST_TMP/config/config"
 export BOXY_SSH_KEY="$TEST_TMP/state/test_ed25519"
 # Keep scratch workdirs inside the test tree so a run leaves nothing behind
 # in the real temp area.

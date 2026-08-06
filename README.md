@@ -591,36 +591,48 @@ written somewhere boxy does not look would need a second step to matter.
 
 It never overwrites an existing config: move the old one aside first.
 
+`--init` never overwrites. If a config or an allowlist is already there it
+writes nothing and names both, because deciding what to do with them is yours:
+
+```
+$ boxy config --init
+warning: ~/.config/boxy/config already exists
+warning: ~/.config/boxy/allowlist.txt already exists
+boxy will not overwrite either; remove or move them, then re-run
+error: config: nothing written
+```
+
 ### Putting the config somewhere else
 
-The config path is not fixed. Two variables set it, and like everything else
-they can come from the environment:
+`BOXY_CONFIG_DIR` is the one knob, and it moves everything:
 
-| Variable            | Default                | |
-| ------------------- | ---------------------- | --- |
-| `BOXY_CONFIG_DIR`   | `~/.config/boxy`       | holds the config and `allowlist.txt` |
-| `BOXY_CONFIG_FILE`  | `$BOXY_CONFIG_DIR/config` | the config file itself |
-
-`BOXY_CONFIG_FILE` wins outright where both are set — it is only *derived* from
-`BOXY_CONFIG_DIR` when you have not set it yourself. So setting the directory
-moves both files, while setting the file moves only the config:
+| Variable          | Default          | |
+| ----------------- | ---------------- | --- |
+| `BOXY_CONFIG_DIR` | `~/.config/boxy` | holds `config` and `allowlist.txt` |
 
 ```bash
-BOXY_CONFIG_DIR=~/work/boxy boxy ls          # config and allowlist both move
-BOXY_CONFIG_FILE=~/work.conf boxy ls         # only the config moves
+BOXY_CONFIG_DIR=~/work/boxy boxy config --init ~/team/boxy.conf
+BOXY_CONFIG_DIR=~/work/boxy boxy create .
 ```
 
-This composes with `--init`, which is how you keep more than one setup around:
+That is how you keep more than one setup around. There is deliberately **no
+separate variable for the config file**: two knobs would let the pair come
+apart, with the config read from one directory and the allowlist from another,
+and nothing to tell you it had happened.
 
-```bash
-BOXY_CONFIG_FILE=~/work.conf boxy config --init ~/team/boxy.conf
-BOXY_CONFIG_FILE=~/work.conf boxy create .
+**It can only come from the environment.** It names the directory holding the
+file that configures boxy, so a value read *from* that file could never have
+applied to finding it — by then boxy has already read it. Setting
+`BOXY_CONFIG_DIR` inside your config is therefore circular, and boxy says so
+and ignores it rather than letting it half-apply:
+
+```
+$ boxy config
+warning: ignoring BOXY_CONFIG_DIR set inside ~/.config/boxy/config —
+         it selects that file, so it must come from the environment
 ```
 
-One wrinkle worth knowing: the allowlist is always
-`$BOXY_CONFIG_DIR/allowlist.txt`, so a config relocated with `BOXY_CONFIG_FILE`
-alone still shares the default directory's allowlist. Set `BOXY_CONFIG_DIR` if
-you want the pair to travel together.
+The rest of that config still loads normally; only the one line is dropped.
 
 ---
 

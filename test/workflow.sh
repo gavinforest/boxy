@@ -295,34 +295,51 @@ section "config --init installs a config you point it at"
 CFG="$TEST_TMP/cfg"
 rm -rf "$CFG"; mkdir -p "$CFG"
 printf '# template\nBOXY_USER=teamuser\n' > "$CFG/team.conf"
-# Note BOXY_CONFIG_FILE, not BOXY_CONFIG_DIR: the file setting wins outright
-# where both are set, which is exactly what lib.sh does to every suite.
-out="$(BOXY_CONFIG_FILE="$CFG/active/config" boxy config --init "$CFG/team.conf" 2>&1)"
-assert_eq "it lands at the active config path" "yes" \
+out="$(BOXY_CONFIG_DIR="$CFG/active" boxy config --init "$CFG/team.conf" 2>&1)"
+assert_eq "it lands in the config dir" "yes" \
     "$( [ -f "$CFG/active/config" ] && echo yes || echo no )"
 assert_contains "and names where it went" "$CFG/active/config" "$out"
 assert_contains "and where it came from" "$CFG/team.conf" "$out"
 # The point of installing to the active path: no extra step to make it count.
 assert_contains "the imported settings are immediately in effect" "teamuser" \
-    "$(BOXY_CONFIG_FILE="$CFG/active/config" boxy config)"
-# dirname of the DESTINATION had to be created here; the old code created
-# BOXY_CONFIG_DIR instead and died with a bare `cp:` error.
+    "$(BOXY_CONFIG_DIR="$CFG/active" boxy config)"
+# One directory holds both, so they can never come apart.
+assert_eq "the allowlist lands beside it" "yes" \
+    "$( [ -f "$CFG/active/allowlist.txt" ] && echo yes || echo no )"
 assert_eq "no source means the bundled example" "same" \
-    "$(BOXY_CONFIG_FILE="$CFG/plain/config" boxy config --init >/dev/null 2>&1; \
+    "$(BOXY_CONFIG_DIR="$CFG/plain" boxy config --init >/dev/null 2>&1; \
        diff -q "$CFG/plain/config" ./boxy.conf.example >/dev/null && echo same || echo differs)"
-assert_contains "an existing config is never overwritten" "already exists" \
-    "$(BOXY_CONFIG_FILE="$CFG/plain/config" boxy config --init 2>&1)"
+
+section "config --init never overwrites, and says what is in the way"
+# Deleting is the caller's to do, so every file blocking the install is named.
+out="$(BOXY_CONFIG_DIR="$CFG/active" boxy config --init 2>&1)"
+assert_contains "it refuses"                "nothing written"        "$out"
+assert_contains "naming the config"         "$CFG/active/config"     "$out"
+assert_contains "and the allowlist too"     "$CFG/active/allowlist.txt" "$out"
+assert_contains "the imported config is untouched" "teamuser" \
+    "$(BOXY_CONFIG_DIR="$CFG/active" boxy config)"
+
+section "BOXY_CONFIG_DIR cannot be set from inside the config"
+# Circular: by the time the file is read, the directory has already been used
+# to find it. Left alone it would half-apply — config from the old directory,
+# allowlist from the new one.
+mkdir -p "$CFG/circ"
+printf 'BOXY_CONFIG_DIR=/somewhere/else\nBOXY_USER=stillread\n' > "$CFG/circ/config"
+out="$(BOXY_CONFIG_DIR="$CFG/circ" boxy config 2>&1)"
+assert_contains "it warns"                "ignoring BOXY_CONFIG_DIR" "$out"
+assert_contains "the rest of the file still applies" "stillread"   "$out"
+assert_contains "and the allowlist stays with the real dir" "$CFG/circ/allowlist.txt" "$out"
 
 section "config rejects what it cannot act on"
 assert_contains "a missing source" "no such file" \
-    "$(BOXY_CONFIG_FILE="$CFG/x/config" boxy config --init "$CFG/nope.conf" 2>&1)"
+    "$(BOXY_CONFIG_DIR="$CFG/x" boxy config --init "$CFG/nope.conf" 2>&1)"
 assert_empty "and creates no destination when the source is bad" \
     "$(ls "$CFG/x/config" 2>/dev/null)"
 assert_contains "unknown option" "unknown option" "$(boxy config --bogus 2>&1)"
 assert_contains "stray argument without --init" "unexpected argument" \
     "$(boxy config stray 2>&1)"
 assert_contains "two sources" "one source at a time" \
-    "$(BOXY_CONFIG_FILE="$CFG/y/config" boxy config --init a.conf b.conf 2>&1)"
+    "$(BOXY_CONFIG_DIR="$CFG/y" boxy config --init a.conf b.conf 2>&1)"
 assert_contains "--help is help, not the settings dump" "usage: boxy config" \
     "$(boxy config --help 2>&1)"
 rm -rf "$CFG"
