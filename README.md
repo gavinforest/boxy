@@ -91,6 +91,7 @@ trust-on-first-use prompt, and no `StrictHostKeyChecking=no`.
 | `boxy info [NAME]`            | One box in detail, config and actual state            |
 | `boxy password [NAME]`        | Print the stored sudo password                        |
 | `boxy env [NAME] [K=V]`       | Set/inject or list environment variables the box sees |
+| `boxy allow [NAME] [DOMAIN]`  | Widen a running `--net limited` box's egress, no restart |
 | `boxy ssh-config [--install]` | Emit / install an `ssh_config` covering every box     |
 | `boxy build [--full]`         | Build the images                                      |
 | `boxy doctor [--verbose]`     | Check the local setup; `-v` adds `boxy info` per box  |
@@ -399,6 +400,12 @@ by name — and an intact sidecar cannot be used as a router even when handed an
 explicit default route pointing at it. It runs with `--cap-drop=ALL` and
 `net.ipv4.ip_forward=0`. (What "intact" is doing there is spelled out below.)
 
+An ingress-only sidecar (`--net none`) keeps nothing at all; a proxying one
+(`--net limited`) gets exactly four back. `SETUID`, `SETGID` and `SETPCAP` are
+tinyproxy's own privilege drop to its unprivileged user, and `KILL` belongs to
+the supervisor — it has to stop tinyproxy to reload the allowlist, and by then
+tinyproxy is no longer running as root.
+
 Under `--net limited` the box _does_ reach the proxy port, necessarily, and it is the one listener exposed to the box.
 
 ### The sidecar is a trust boundary
@@ -453,13 +460,63 @@ boxy-sidecar-<name>` directly; the container name is always
 The shipped allowlist covers PyPI, conda-forge, GitHub, npm, Debian, Hugging
 Face and the Anthropic API.
 
-**The allowlist is read once, at `boxy create`.** Its contents are passed to the
-sidecar as an environment variable at `docker run`, so editing
-`~/.config/boxy/allowlist.txt` afterwards has no effect on boxes that already
-exist — and restarting the sidecar does not help, because it re-reads the same
-value that was baked in at creation. To change what a box may reach, recreate
-it (`--allow` covers the one-off case). Existing boxes keep the allowlist they
-were born with.
+**The shared allowlist is read once, at `boxy create`**, and copied to a file of
+the box's own:
+
+```
+~/.local/share/boxy/instances/<name>/proxy/allowlist.txt
+```
+
+That copy — not the shared file — is what the box actually enforces. Editing
+`~/.config/boxy/allowlist.txt` therefore affects the *next* box you create and
+never rewrites the rules under boxes already running.
+
+To change what a running box may reach, use `boxy allow`:
+
+```bash
+boxy allow web example.com        # widen this box, now
+boxy allow web                    # print what it may currently reach
+boxy allow web --reload           # replace from ~/.config/boxy/allowlist.txt
+```
+
+It takes effect in about a third of a second, and **live ssh sessions and port
+forwards are not disturbed** — which is the whole difficulty, since an isolated
+box's ssh port is carried by socat inside that same sidecar and restarting the
+container drops every session it is holding. `boxy allow` never writes to
+`~/.config/boxy/allowlist.txt`; a grant applies to that one box until you
+`boxy rm` it. It only works on `--net limited`, the only mode with an allowlist
+to widen.
+
+<details>
+<summary>How the reload works, and why it isn't simply a restart</summary>
+
+The box's copy is bind-mounted into the sidecar **read only** at
+`/etc/boxy-proxy/allowlist.txt`. Two consequences follow. Changing policy is a
+host-side write plus one signal, so nothing is exec'd into the sidecar to move
+it; and the sidecar cannot edit its own rules, so a compromised one has no way
+to make a widening of its policy persist.
+
+tinyproxy compiles its filter list once at startup. It does have a `SIGHUP`
+handler, but that only re-reads the config file — signal it directly and it
+will cheerfully log `Reloading config file finished` while continuing to
+enforce the old policy. Restarting the process is the only thing that actually
+reloads it.
+
+So the sidecar's PID 1 is the entrypoint script acting as a supervisor, rather
+than tinyproxy itself: on `SIGHUP` it rebuilds the filter and restarts *only*
+tinyproxy, leaving the socat listeners — and the ssh sessions riding them —
+untouched. It bumps a counter at `/run/boxy-proxy-generation` each time, which
+`boxy allow` reads before and after signalling, so a reload is confirmed rather
+than assumed.
+
+Two consequences of the sidecar's PID 1 being a shell are worth naming. It
+needs `CAP_KILL`, because tinyproxy drops to its own user and signalling
+another user's process is exactly what that capability governs — without it the
+reload fails with `EPERM`. And it must trap `SIGTERM` itself, because the
+kernel discards default-action signals sent to PID 1: an untrapped shell there
+never hears `docker stop` and waits out the full ten-second grace period before
+being killed.
+</details>
 
 One quirk worth knowing when testing this yourself: a _blocked HTTPS_ request
 shows up as `curl` exit 7 / status `000`, not a 403. HTTPS goes through the
@@ -770,10 +827,12 @@ narrates every step. Then `boxy exec <name>`, which uses `docker exec` and
 does not depend on SSH at all.
 
 **A `--net limited` box can't reach something it should.** `docker logs
-boxy-sidecar-<name>` names every refused domain. Add it to
-`~/.config/boxy/allowlist.txt` (applies to boxes created afterwards) or pass
-`--allow` on the next `create`. Remember that a blocked HTTPS request looks
-like a timeout/`000`, not a 403.
+boxy-sidecar-<name>` names every refused domain. `boxy allow <name> <domain>`
+grants it to that box straight away, without dropping the session you are sitting
+in. For a domain every box should have, add it to `~/.config/boxy/allowlist.txt`
+instead — that applies to boxes created afterwards — or pass `--allow` on the next
+`create`. Remember that a blocked HTTPS request looks like a timeout/`000`, not a
+403.
 
 **An isolated box is unreachable over SSH.** Its ports live on the sidecar,
 so check that one first: `docker logs boxy-sidecar-<name>` should report the

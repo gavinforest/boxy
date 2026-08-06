@@ -41,6 +41,11 @@
 #BOXY_BIND_ADDR=127.0.0.1
 
 # Default egress policy: full | none | limited
+#
+# Under `limited` the allowlist beside this file is copied into each box at
+# create time, so editing it changes the next box rather than boxes already
+# running. `boxy allow NAME DOMAIN` widens one running box without restarting
+# its sidecar, and so without dropping live ssh sessions.
 #BOXY_NET=full
 
 # --- container privileges --------------------------------------------------

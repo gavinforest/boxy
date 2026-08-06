@@ -319,6 +319,13 @@ port_free() {
 
 state_dir_for() { printf '%s\n' "$BOXY_STATE_DIR/instances/$1"; }
 
+# One box's egress policy, and the only thing bind-mounted into its sidecar.
+# It gets its own subdirectory because the state directory around it holds the
+# box's sudo password and ssh host keys, and the sidecar has no business
+# reading either.
+proxy_dir_for()      { printf '%s\n' "$(state_dir_for "$1")/proxy"; }
+box_allowlist_file() { printf '%s\n' "$(proxy_dir_for "$1")/allowlist.txt"; }
+
 # Count state directories with no container behind them.
 #
 # These appear when a box is removed outside boxy (`docker rm` by hand). The
@@ -921,7 +928,7 @@ ${pair%%:*}:$NB_NAME:${pair##*:}"
     done
 
     local caps="--cap-drop=ALL"
-    local envs=()
+    local mounts=()
     if [ "$NB_NET" = "limited" ]; then
         NB_PROXY_URL="http://$NB_SIDECAR_NAME:8888"
         local allowlist a
@@ -931,10 +938,34 @@ ${pair%%:*}:$NB_NAME:${pair##*:}"
 $a"
         done
         [ -n "$allowlist" ] || die "egress allowlist is empty; nothing would be reachable"
-        envs[${#envs[@]}]="-e"; envs[${#envs[@]}]="BOXY_ALLOWLIST=$allowlist"
-        # tinyproxy starts as root and drops to its own user, which needs these
-        # two back. socat alone needs nothing.
-        caps="$caps --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP"
+
+        # The box's own copy of the policy, taken now and never re-read from
+        # the shared file: editing that file is meant to affect the next box,
+        # not silently rewrite the rules under boxes already running.
+        mkdir -p "$(proxy_dir_for "$NB_NAME")"
+        printf '%s\n' "$allowlist" > "$(box_allowlist_file "$NB_NAME")"
+
+        # Mounted rather than passed as an environment variable, because an
+        # environment variable is fixed for the life of a container and this
+        # has to be changeable on a running one — see cmd_allow. Read only:
+        # boxy is the only writer, and a compromised sidecar has no way to
+        # make a widening of its own policy stick.
+        #
+        # The directory is mounted, not the file. A single-file bind mount
+        # pins one inode, so any editor that saves by writing a temporary file
+        # and renaming it over the original would leave the container reading
+        # the old contents forever.
+        mounts[${#mounts[@]}]="-v"
+        mounts[${#mounts[@]}]="$(proxy_dir_for "$NB_NAME"):/etc/boxy-proxy:ro"
+
+        # tinyproxy starts as root and drops to its own user, which needs the
+        # first three back. socat alone needs nothing.
+        #
+        # KILL is for the supervisor, not the proxy: the sidecar's PID 1 has to
+        # stop tinyproxy to reload the allowlist, and by then tinyproxy is no
+        # longer running as root. Signalling another user's process is exactly
+        # what CAP_KILL governs, so without it the reload fails with EPERM.
+        caps="$caps --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP --cap-add=KILL"
     fi
 
     info "starting sidecar $NB_SIDECAR_NAME"
@@ -952,7 +983,7 @@ $a"
         -p "$BOXY_BIND_ADDR:$NB_SSH_PORT:$NB_SSH_PORT" \
         $(for pair in $NB_PUBLISHED; do printf -- '-p %s:%s:%s ' "$BOXY_BIND_ADDR" "${pair%%:*}" "${pair%%:*}"; done) \
         -e "BOXY_RELAY=$relay" \
-        ${envs[@]+"${envs[@]}"} \
+        ${mounts[@]+"${mounts[@]}"} \
         "$BOXY_PROXY_IMAGE" >/dev/null
 
     # Second attachment, after creation: the port bindings above only exist
@@ -1379,6 +1410,12 @@ cmd_info() {
     printf 'forwardable %s   %s(boxy forward %s)\n' "$BOXY_PORTS" "$C_DIM$C_OFF" "$name"
     if [ "$(inst_label "$name" boxy.net)" = "limited" ]; then
         printf 'sidecar     boxy-sidecar-%s (docker logs boxy-sidecar-%s for denials)\n' "$name" "$name"
+        local af n
+        af="$(box_allowlist_file "$name")"
+        if [ -f "$af" ]; then
+            n="$(grep -c . "$af" || true)"
+            printf 'egress      %s domain(s)   %s(boxy allow %s)%s\n' "$n" "$C_DIM" "$name" "$C_OFF"
+        fi
     fi
 }
 
@@ -1507,6 +1544,142 @@ cmd_env() {
     ok "$name now has $n variable(s) set"
     note "new ssh sessions and 'boxy exec' see them; they survive a restart"
     note "in a session already open: . /etc/profile.d/boxy-env.sh"
+}
+
+# ===========================================================================
+# allow — widen one running box's egress allowlist
+# ===========================================================================
+# Only `--net limited` has an allowlist at all: `full` is unrestricted and
+# `none` has no egress to permit.
+#
+# Nothing is exec'd into the sidecar to move policy. The list is a host file
+# bind-mounted read only, so a change is a local write plus one signal, and the
+# signal is the whole reason this is not simply a restart: the sidecar carries
+# the box's ssh port on socat listeners, so restarting it drops every live
+# session and every forward. Its PID 1 restarts only tinyproxy, in place.
+BOXY_PROXY_GENERATION=/run/boxy-proxy-generation
+
+# Domains are written into a file that becomes a list of extended regexes, so
+# this is the check that stops a fat-fingered `*` or `.*` from quietly allowing
+# everything. Labels are alphanumeric with inner hyphens, and at least one dot
+# is required so that a mistyped box name cannot be mistaken for a domain.
+allow_domain_ok() {
+    printf '%s' "$1" | grep -Eq \
+        '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+}
+
+allow_require_limited() {
+    local name="$1" net
+    net="$(inst_label "$name" boxy.net)"
+    case "$net" in
+        limited) ;;
+        full) die "allow: $name runs with --net full and already reaches everything — there is no allowlist to widen" ;;
+        none) die "allow: $name runs with --net none — it has no egress at all, and no proxy to allow anything through. Recreate it with --net limited." ;;
+        *)    die "allow: cannot read $name's network policy" ;;
+    esac
+}
+
+# The counter the sidecar bumps each time it starts the proxy. Empty means the
+# sidecar has no supervisor to bump it: an image built before live reload
+# existed, whose PID 1 is tinyproxy itself and which answers SIGHUP by reloading
+# a config file and changing nothing.
+allow_generation() { docker exec "$1" cat "$BOXY_PROXY_GENERATION" 2>/dev/null || true; }
+
+# Signal the sidecar, then wait for it to say it acted — so a reload is
+# confirmed rather than assumed. Returns non-zero rather than dying, because
+# the caller has already written the policy file and has to put it back.
+allow_reload_sidecar() {
+    local sc="$1" before="$2" after i=0
+    docker kill -s HUP "$sc" >/dev/null 2>&1 || return 1
+    while [ "$i" -lt 50 ]; do
+        after="$(allow_generation "$sc")"
+        if [ -n "$after" ] && [ "$after" != "$before" ]; then return 0; fi
+        sleep 0.1
+        i=$(( i + 1 ))
+    done
+    return 1
+}
+
+cmd_allow() {
+    require_docker
+    local name="" mode="add"
+    local domains=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --reload) mode="reload"; shift ;;
+            -h|--help)
+                printf 'usage: boxy allow [NAME] [DOMAIN ...] [--reload]\n'
+                printf '  with no domains, lists what this box may reach\n'
+                printf '  --reload  replace from %s\n' "$(allowlist_file)"
+                printf '  applies to the running box only; the file above is never written\n'
+                return 0 ;;
+            -*) die "allow: unknown option $1" ;;
+            *)
+                # A bare word is the box unless a box by that name is already
+                # ruled out and it parses as a domain. Names are checked first
+                # so that a box someone named with a dot still resolves.
+                if [ -z "$name" ] && { instance_exists "$1" || ! allow_domain_ok "$1"; }; then
+                    name="$1"
+                else
+                    allow_domain_ok "$1" || die "allow: '$1' is not a domain"
+                    domains[${#domains[@]}]="$1"
+                fi
+                shift ;;
+        esac
+    done
+    name="$(resolve_instance "$name")"
+    allow_require_limited "$name"
+
+    local f; f="$(box_allowlist_file "$name")"
+    [ -f "$f" ] || die "allow: $name has no allowlist at $f — it was created before per-box allowlists; recreate it"
+
+    if [ "${#domains[@]}" -eq 0 ] && [ "$mode" = "add" ]; then
+        cat "$f"
+        return 0
+    fi
+
+    local sc="boxy-sidecar-$name"
+    instance_exists "$sc" || die "allow: sidecar $sc is gone; recreate the box"
+    docker inspect -f '{{.State.Running}}' "$sc" 2>/dev/null | grep -q true \
+        || die "allow: sidecar $sc is not running — start the box first"
+
+    # Established before anything is written. The file is what `boxy allow`
+    # reports as this box's policy, so it must not come to claim a domain that
+    # the sidecar was never able to start enforcing.
+    local gen; gen="$(allow_generation "$sc")"
+    [ -n "$gen" ] || die "allow: $sc cannot reload — its image predates this feature. Run 'boxy build', then recreate the box."
+
+    local out d
+    if [ "$mode" = "reload" ]; then
+        out="$(grep -v '^[[:space:]]*#' "$(allowlist_file)" | grep -v '^[[:space:]]*$' || true)"
+        [ -n "$out" ] || die "allow: $(allowlist_file) is empty; nothing would be reachable"
+    else
+        out="$(cat "$f")"
+    fi
+    # Appended only if absent, so repeating a domain is a no-op rather than a
+    # file that grows a duplicate line every time.
+    for d in ${domains[@]+"${domains[@]}"}; do
+        if ! printf '%s\n' "$out" | grep -qx "$d"; then
+            out="$out
+$d"
+        fi
+    done
+
+    local prev; prev="$(cat "$f")"
+    printf '%s\n' "$out" > "$f"
+    if ! allow_reload_sidecar "$sc" "$gen"; then
+        printf '%s\n' "$prev" > "$f"
+        die "allow: $sc never confirmed the reload, so the change was rolled back — see 'docker logs $sc'"
+    fi
+
+    local n; n="$(printf '%s\n' "$out" | grep -c . || true)"
+    ok "$name may now reach $n domain(s)"
+    if [ "$mode" = "reload" ]; then
+        note "replaced from $(allowlist_file); domains added with 'boxy allow' are gone"
+    else
+        note "this box only — $(allowlist_file) is unchanged, so new boxes are unaffected"
+    fi
+    note "live ssh sessions and forwards are untouched"
 }
 
 # ===========================================================================
@@ -1921,6 +2094,7 @@ CORE
   info [NAME]                one box in detail, config vs reality
   password [NAME]            print the stored sudo password
   env [NAME] [K=V ...]       list or set/inject env vars
+  allow [NAME] [DOMAIN ...]  widen a running box's egress, no restart
   ssh-config [--install]     emit/install ssh_config for every box
   build [--full]             build the images
   doctor [--verbose]         check the local setup; -v adds per-box info
@@ -1952,6 +2126,7 @@ main() {
         forward|fwd) cmd_forward "$@" ;;
         password|pw) cmd_password "$@" ;;
         env)         cmd_env "$@" ;;
+        allow)       cmd_allow "$@" ;;
         ssh-config)  cmd_ssh_config "$@" ;;
         start)       cmd_start "$@" ;;
         stop)        cmd_stop "$@" ;;

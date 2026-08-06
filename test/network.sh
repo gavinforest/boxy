@@ -90,6 +90,68 @@ boxy create -n ltd2 --net limited --allow example.com >/dev/null 2>&1
 assert_eq "the extra domain is reachable" "200" \
     "$(bssh ltd2 'curl -s -o /dev/null -w "%{http_code}" --max-time 20 http://example.com/')"
 
+section "boxy allow: changing egress policy on a running box"
+# The policy is a host file bind-mounted read only, so the sidecar cannot edit
+# its own rules and boxy never has to exec anything in to change them.
+assert_eq "the sidecar cannot write its own allowlist" "read-only" \
+    "$(docker exec boxy-sidecar-ltd sh -c \
+       'echo evil.com >> /etc/boxy-proxy/allowlist.txt && echo WRITABLE || echo read-only' 2>/dev/null)"
+assert_eq "the box's copy is separate from the shared file" "example.com" \
+    "$(tail -1 "$BOXY_STATE_DIR/instances/ltd2/proxy/allowlist.txt")"
+
+# Reloading must not disturb ingress: the sidecar carries the box's ssh port on
+# socat, so a restart of the container would drop every live session. Pinning
+# socat's pid on both sides is the direct way to show it was left alone.
+SOCAT_BEFORE="$(docker exec boxy-sidecar-ltd sh -c \
+    'for p in /proc/[0-9]*; do case "$(tr "\0" " " < $p/cmdline 2>/dev/null)" in socat*) echo ${p#/proc/};; esac; done' | head -1)"
+# A session opened before the change, still running while it happens.
+bssh ltd 'sleep 12; echo SURVIVED' > "$TEST_TMP/allow-session.log" 2>&1 &
+ALLOW_BG=$!
+sleep 3
+boxy allow ltd example.com >/dev/null 2>&1
+assert_eq "the newly allowed domain is reachable at once" "200" \
+    "$(bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 20 http://example.com/')"
+assert_eq "a domain already allowed still is" "200" \
+    "$(bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 25 https://pypi.org/simple/')"
+wait "$ALLOW_BG" 2>/dev/null
+assert_contains "the session open across the change survived it" "SURVIVED" \
+    "$(cat "$TEST_TMP/allow-session.log")"
+assert_eq "and the ingress listener was never restarted" "$SOCAT_BEFORE" \
+    "$(docker exec boxy-sidecar-ltd sh -c \
+       'for p in /proc/[0-9]*; do case "$(tr "\0" " " < $p/cmdline 2>/dev/null)" in socat*) echo ${p#/proc/};; esac; done' | head -1)"
+
+# The point of a per-box list: widening one box must not widen the next one.
+assert_eq "the shared allowlist file is untouched" "" \
+    "$(grep -x 'example.com' "$BOXY_CONFIG_DIR/allowlist.txt" 2>/dev/null || true)"
+assert_eq "the change survives a restart of the box" "200" \
+    "$(boxy restart ltd >/dev/null 2>&1; sleep 4;
+       bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 20 http://example.com/')"
+
+section "boxy allow: refusals"
+assert_contains "a domain that is really a regex is refused" "is not a domain" \
+    "$(boxy allow ltd '.*' 2>&1)"
+assert_contains "so is a bare word with no dot" "is not a domain" \
+    "$(boxy allow ltd nodots 2>&1)"
+assert_contains "--net none has no proxy to widen" "no egress at all" \
+    "$(boxy allow nonet example.com 2>&1)"
+assert_eq "a repeated domain does not duplicate the line" "1" \
+    "$(boxy allow ltd example.com >/dev/null 2>&1; grep -cx 'example.com' \
+       "$BOXY_STATE_DIR/instances/ltd/proxy/allowlist.txt")"
+assert_contains "--reload drops per-box additions" "domains added" \
+    "$(boxy allow ltd --reload 2>&1)"
+assert_eq "and the domain is blocked again" "403" \
+    "$(bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 15 http://example.com/')"
+
+section "the sidecar answers SIGTERM"
+# Its PID 1 is a supervisor script rather than tinyproxy itself, and the kernel
+# discards default-action signals sent to PID 1 — so without an explicit trap
+# every stop would sit out docker's full ten-second grace period.
+STOP_START="$(date +%s)"
+docker stop boxy-sidecar-ltd2 >/dev/null 2>&1
+assert_eq "stopping it takes seconds, not the full grace period" "prompt" \
+    "$([ "$(( $(date +%s) - STOP_START ))" -lt 8 ] && echo prompt || echo "waited out SIGKILL")"
+docker start boxy-sidecar-ltd2 >/dev/null 2>&1
+
 section "boxes never restart on their own"
 # Kept as a deliberate default rather than a safety net: isolation no longer
 # depends on it. A box you forgot to remove should not come back on its own.
@@ -114,6 +176,12 @@ assert_eq "no capabilities at all" "0000000000000000" \
        docker exec boxy-sidecar-nonet sh -c 'grep CapBnd /proc/1/status' | awk '{print $2}')"
 assert_eq "and cannot be made a router" "0" \
     "$(docker exec boxy-sidecar-nonet cat /proc/sys/net/ipv4/ip_forward)"
+# A proxying sidecar needs four back, and only four. Three are tinyproxy's own
+# privilege drop; KILL is the supervisor's, to stop tinyproxy for a reload once
+# it is no longer running as root.
+assert_eq "a proxying one grants exactly four" "[CAP_KILL CAP_SETGID CAP_SETPCAP CAP_SETUID]" \
+    "$(docker inspect boxy-sidecar-ltd2 --format '{{.HostConfig.CapAdd}}' \
+       | tr -d '[]' | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ $//;s/^/[/;s/$/]/')"
 
 section "published ports work on a sealed box"
 # Docker refuses to bind a host port for an internal-only container, so this
