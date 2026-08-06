@@ -161,7 +161,7 @@ outlived their boxes.
 -u, --user NAME       login user (default: boxyboy)
 -k, --key PATH        public key to authorize (default: $BOXY_SSH_KEY.pub)
     --net MODE        full | none | limited   (default: full)
-    --caps MODE       minimal | default capability set (default: minimal)
+    --caps MODE       minimal | docker-default        (default: minimal)
     --allow DOMAIN    extra allowed domain for --net limited (repeatable)
 -p, --publish SPEC    publish a port: PORT or HOSTPORT:PORT (repeatable)
     --image IMG       image to run
@@ -868,8 +868,13 @@ CPU-only; for GPU you would add a CUDA build target and `jax[cuda12]`.
 ## Troubleshooting
 
 **`boxy doctor`** first — it checks the daemon, images, keys and wordlist
-cache, and flags any isolated box that has lost its isolation. Add
-`--verbose` for a full `boxy info` on every box.
+cache, and counts boxes and any orphaned state left by a `docker rm` done
+outside boxy. Add `--verbose` for a full `boxy info` on every box.
+
+It does *not* check whether an isolated box is still isolated, and there is
+nothing there to check: isolation is a property of the box's network, which
+Docker enforces and a restart cannot undo. An earlier boxy applied isolation
+to the running container and did need that check.
 
 **Box created but SSH times out.** Read `boxy logs <name>`; the entrypoint
 narrates every step. Then `boxy exec <name>`, which uses `docker exec` and

@@ -34,27 +34,29 @@ boxy 1.0.0 — disposable SSH-reachable dev boxes
 
 usage: boxy <command> [options]
 
-CORE — the reason boxy exists
-  create [options]           create and start a box   (boxy create --help)
+CORE
+  create [TARGET]            . | worktree | PATH, or nothing for scratch
   ssh [NAME] [-- CMD]        interactive session, or one command
-  forward [NAME] [PORTS]     tunnel box ports to the SAME localhost ports
-  rm NAME...                 remove a box (never touches your files)
+  forward [NAME] [PORTS]     tunnel box ports to the SAME local ports
+  rm NAME...                 remove a box (doesn't touch your files)
   ls                         list boxes
-  info [NAME]                one box in detail, including its port map
+  info [NAME]                one box in detail, config vs reality
   password [NAME]            print the stored sudo password
-  ssh-config [--install]     emit/install an ssh_config covering every box
-  build [--full]             build the images     (boxy build --help)
-  doctor                     check the local setup
+  env [NAME] [K=V ...]       list or set/inject env vars
+  allow [NAME] [DOMAIN ...]  widen a running box's egress, no restart
+  ssh-config [--install]     emit/install ssh_config for every box
+  build [--full]             build the images
+  doctor [--verbose]         check the local setup; -v adds per-box info
   config [--init]            show or scaffold configuration
 
-DOCKER PASSTHROUGH — thin wrappers that resolve the name and add boxy's
-defaults, then hand off. Equivalent plain-docker command in brackets.
-  exec [NAME] [CMD]          [docker exec]    a way in that does not use ssh
-  logs [NAME] [-f]           [docker logs]    the box's entrypoint narration
-  start|stop|restart [NAME]  [docker start…]  lifecycle
-  top [--watch]              [docker stats]   live CPU/memory per box
+DOCKER PASSTHROUGH — resolve the box name, then hand off to docker
+  exec [NAME] [CMD]          adds defaults: as box user, at /work
+  logs [NAME] [-f]           the box's entrypoint narration
+  start|stop|restart [NAME]  lifecycle + ensures sidecar follows box
+  top [--watch]              [docker stats] for boxes and sidecars
 
 The name may be omitted whenever exactly one box exists.
+Full options: boxy create --help, boxy build --help
 ```
 
 Sidecars do not count toward that: a `--net limited` box brings a proxy
@@ -83,9 +85,14 @@ boxy 1.0.0
   EFF wordlist             not cached (fetched on first create)
   config                   ~/.config/boxy/config
   state                    ~/.local/share/boxy
+  boxes                    0
 
 looks healthy
 ```
+
+What it does not check is whether an isolated box is still isolated. There is
+nothing to check: isolation is a property of the box's network rather than of
+the running container, so nothing can lose it. §7 goes into why.
 
 ---
 
@@ -329,7 +336,9 @@ The conda prefix is owned by the box user because everything is installed *as*
 that user at build time. The obvious alternative — `RUN chown -R` at the end —
 costs 3.44 GB, because Docker layers are copy-on-write per file and a metadata
 change rewrites every one of ~40k files into the new layer. Avoiding it took
-the image from **7.41 GB to 3.97 GB**.
+that build from **7.41 GB to 3.97 GB** — measured on a much fatter image than
+the one boxy ships now. Today's default build is **2.23 GB**; the saving is a
+property of the chown, not of the package list, so it still applies.
 
 ### The volume is live in both directions
 
@@ -337,6 +346,54 @@ the image from **7.41 GB to 3.97 GB**.
   host -> box : # a file that was already on the host
   box  -> host: the answer is 42
   host dir    : notes.md results.txt
+```
+
+### Environment variables the box actually sees
+
+```
+$ boxy env demo API_KEY=secret REGION=us-east-1
+demo now has 2 variable(s) set
+new ssh sessions and 'boxy exec' see them; they survive a restart
+in a session already open: . /etc/profile.d/boxy-env.sh
+
+$ boxy env demo
+API_KEY=secret
+REGION=us-east-1
+
+$ boxy ssh demo -- 'echo $API_KEY'
+secret
+```
+
+`docker run -e` does not cover this. A variable set that way lands in PID 1's
+environment, which the box's own processes and `boxy exec` inherit — but an ssh
+session does not, because sshd builds a fresh environment through PAM rather
+than inheriting PID 1's. And `-e` is fixed for the life of the container, so
+adding a variable would mean recreating the box.
+
+The awkward case is `ssh box cmd`, which reads no profile and no rc of its own.
+It works because bash sources `~/.bashrc` when sshd started it, and boxy's block
+sits at the *top* of that file — above the `case $- in *i*) ;; *) return;; esac`
+guard Debian ships, below which the non-interactive case returns before ever
+reaching it.
+
+There is no host-side copy and nothing replayed on start: the file lives in the
+container, so it survives a restart untouched — and can be read back while the
+box is stopped, since boxy lifts it out with `docker cp` rather than needing
+anything running to ask:
+
+```
+$ boxy stop demo && boxy env demo
+API_KEY=secret
+REGION=us-east-1
+```
+
+`PATH` and `BOXY_*` are refused — the first because replacing the box's own
+breaks every command in it, the second because that is boxy's channel into the
+entrypoint:
+
+```
+$ boxy env demo PATH=/evil
+error: env: refusing 'PATH' — names must be identifiers, and PATH and BOXY_* belong to boxy
 ```
 
 ---
@@ -524,6 +581,42 @@ real 403.
 The shipped allowlist covers PyPI, conda-forge, GitHub, npm, Debian, Hugging
 Face and the Anthropic API.
 
+### Changing the policy without dropping the session
+
+The shared allowlist is read once, at create, and copied to a file of the box's
+own — so editing it affects the *next* box rather than rewriting the rules
+under boxes already running. To widen a box that is running, use `boxy allow`:
+
+```
+$ boxy allow ltd example.com
+ltd may now reach 25 domain(s)
+this box only — ~/.config/boxy/allowlist.txt is unchanged, so new boxes are unaffected
+live ssh sessions and forwards are untouched
+```
+
+That last line is the difficulty the whole feature is about. The box's ssh port
+is carried by `socat` inside the very sidecar the proxy lives in, so restarting
+the sidecar would drop every session and forward it is holding. Instead the
+box's copy of the policy is bind-mounted **read only** into the sidecar, whose
+PID 1 is a supervisor rather than tinyproxy itself: on `SIGHUP` it rebuilds the
+filter and restarts *only* tinyproxy. Read only matters — a compromised sidecar
+cannot widen its own rules.
+
+tinyproxy has to be restarted rather than signalled, because it compiles its
+filter once at startup. It *has* a `SIGHUP` handler, but that only re-reads the
+config file: signal it directly and it logs `Reloading config file finished`
+while continuing to enforce the old policy.
+
+Entries are domains, not patterns — the filter is a list of regexes and only
+dots are escaped on the way in, so `[^q]*` would otherwise become
+`^(.*\.)?[^q]*$` and match everything. Every route into the list is checked
+against the same rule, `--allow` and the file included:
+
+```
+$ boxy allow ltd '*.example.com'
+error: allow: '*.example.com' — drop the '*.', subdomains are already included
+```
+
 ---
 
 ## 8. Using a box as a remote
@@ -676,8 +769,12 @@ same story (`sudo pkill` silently fails without it), as are
 Verified still working under the reduced set: ssh login, sudo to uid 0, ping,
 binding port 80 as an unprivileged user, `pip install`, and `git commit`.
 
-`boxy create --caps default` restores Docker's full 14 — the fastest way to
-rule capabilities in or out when something misbehaves.
+`boxy create --caps docker-default` restores Docker's full 14 — the fastest way
+to rule capabilities in or out when something misbehaves. Note which is which:
+`minimal` is boxy's default, and `docker-default` names Docker's own set. The
+value used to be spelled `default`, which read backwards — it named the set you
+never got by default. That spelling is still accepted so old configs keep
+working, but it normalises to `docker-default`.
 
 ---
 
@@ -689,23 +786,23 @@ rule capabilities in or out when something misbehaves.
 ```
 
 ```
-core:     45 passed, 0 failed
-network:  27 passed, 0 failed
-workflow: 28 passed, 0 failed
+core:     62 passed, 0 failed
+network:  64 passed, 0 failed
+workflow: 109 passed, 0 failed
 
 all suites passed
 ```
 
-100 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
+235 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
 under `$TMPDIR` with their own keypair, so they cannot touch a real install or
 your `~/.ssh` — though they *do* remove every boxy-managed container on the
 host, since a shared Docker daemon is the one resource they cannot sandbox.
 
 | Suite | Covers |
 | --- | --- |
-| `core` | creation, the box interior, the volume, sudo, sshd hardening, host-key pinning, capability policy |
-| `network` | `--net none` / `--net limited`, DNS and on-link hardening, restart persistence, allowlist, teardown |
-| `workflow` | ports and `-p`, forwarding, cloning, `ssh_config`, `exec`, the rm/workdir contract |
+| `core` | creation, the box interior, the volume, sudo, sshd hardening, host-key pinning, capability policy, symlinked install, rollback of a failed create |
+| `network` | `--net none` / `--net limited`, DNS and on-link hardening, restart persistence, the allowlist and `boxy allow`, domain validation, teardown |
+| `workflow` | ports and `-p`, forwarding, `ssh_config`, `exec`, `boxy env`, the rm/workdir contract |
 
 ---
 
@@ -727,3 +824,14 @@ host, since a shared Docker daemon is the one resource they cannot sandbox.
 - **A worktree box can rewrite your local git history.** It has the repo's
   object store mounted read-write, so it can move branches and delete objects.
   It carries no credentials, so the damage stops at your machine.
+- **Isolated boxes are capped by Docker's address pools.** Each `--net none` or
+  `--net limited` box gets its own network, and Docker's defaults run out
+  somewhere around two to three dozen of them. A create that hits the ceiling
+  fails with the daemon's own message and rolls back cleanly, but the ceiling
+  is Docker's to raise (`default-address-pools` in `daemon.json`), not boxy's.
+- **The sidecar is a trust boundary, not a sandbox.** It is dual-homed and has
+  real internet access by design, so a compromised one relays the box out in
+  userspace — no capabilities and no kernel forwarding required. Under
+  `--net none` the box has no way to reach it, which is what actually protects
+  a sealed box; under `--net limited` the box must reach tinyproxy, so there
+  the surface is real. §7 and the README's security notes go into this.
