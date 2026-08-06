@@ -142,6 +142,18 @@ assert_contains "--reload drops per-box additions" "domains added" \
 assert_eq "and the domain is blocked again" "403" \
     "$(bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 15 http://example.com/')"
 
+# The counter ticks when the replacement proxy is launched, not once it has
+# taken the port, so a proxy that cannot start must not be reported as a live
+# policy on the strength of the counter alone. Breaking its config is the
+# cheapest way to make starting fail for real.
+boxy create -n brk --net limited >/dev/null 2>&1
+docker exec -u root boxy-sidecar-brk sh -c 'printf "Port notanumber\n" > /etc/tinyproxy/tinyproxy.conf'
+assert_contains "a proxy that cannot restart is a failed reload" "rolled back" \
+    "$(boxy allow brk example.com 2>&1)"
+assert_eq "and the domain is not left in the box's policy" "0" \
+    "$(grep -c 'example.com' "$BOXY_STATE_DIR/instances/brk/proxy/allowlist.txt" || true)"
+boxy rm brk >/dev/null 2>&1
+
 section "the sidecar answers SIGTERM"
 # Its PID 1 is a supervisor script rather than tinyproxy itself, and the kernel
 # discards default-action signals sent to PID 1 — so without an explicit trap

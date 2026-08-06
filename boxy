@@ -1593,7 +1593,15 @@ allow_reload_sidecar() {
     docker kill -s HUP "$sc" >/dev/null 2>&1 || return 1
     while [ "$i" -lt 50 ]; do
         after="$(allow_generation "$sc")"
-        if [ -n "$after" ] && [ "$after" != "$before" ]; then return 0; fi
+        if [ -n "$after" ] && [ "$after" != "$before" ]; then
+            # The counter ticks when the new proxy is launched, not once it has
+            # taken the port. A proxy that cannot bind exits immediately and
+            # the supervisor follows it down, so settle briefly and confirm the
+            # sidecar is still there before calling the new policy live.
+            sleep 0.3
+            docker inspect -f '{{.State.Running}}' "$sc" 2>/dev/null | grep -q true || return 1
+            return 0
+        fi
         sleep 0.1
         i=$(( i + 1 ))
     done
