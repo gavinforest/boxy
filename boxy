@@ -1572,7 +1572,7 @@ cmd_info() {
     else
         printf 'published   (none)\n'
     fi
-    printf 'forwardable %s   %s(boxy forward %s)\n' "$BOXY_PORTS" "$C_DIM$C_OFF" "$name"
+    printf 'forwardable %s   %s(boxy forward %s)%s\n' "$BOXY_PORTS" "$C_DIM" "$name" "$C_OFF"
     if [ "$(inst_label "$name" boxy.net)" = "limited" ]; then
         printf 'sidecar     boxy-sidecar-%s (docker logs boxy-sidecar-%s for denials)\n' "$name" "$name"
         local af n
@@ -1731,6 +1731,32 @@ cmd_env() {
 # the box's ssh port on socat listeners, so restarting it drops every live
 # session and every forward. Its PID 1 restarts only tinyproxy, in place.
 BOXY_PROXY_GENERATION=/run/boxy-proxy-generation
+BOXY_PROXY_ALLOWLIST=/etc/boxy-proxy/allowlist.txt
+
+# Wait until the sidecar can SEE the policy just written, before asking it to
+# rebuild from it.
+#
+# A bind-mounted write is not instantly visible inside the container on Docker
+# Desktop, where the mount crosses a virtual filesystem into the VM rather than
+# being the same kernel's page cache. Measured here: usually visible on the
+# first read, occasionally not for the better part of a second.
+#
+# That was long enough to matter. Signalling immediately let the supervisor
+# rebuild the filter from the OLD file, bump its generation, and report a
+# perfectly healthy reload of a policy nobody asked for — `boxy allow` returned
+# success and the domain was still refused with a 403. The generation counter
+# cannot catch this on its own: it confirms that a restart happened, not that
+# the restart read what you wrote.
+allow_await_visible() {
+    local sc="$1" want="$2" i=0
+    while [ "$i" -lt 100 ]; do
+        [ "$(docker exec "$sc" cat "$BOXY_PROXY_ALLOWLIST" 2>/dev/null)" = "$want" ] \
+            && return 0
+        sleep 0.1
+        i=$(( i + 1 ))
+    done
+    return 1
+}
 
 allow_require_limited() {
     local name="$1" net
@@ -1843,7 +1869,10 @@ $d"
 
     local prev; prev="$(cat "$f")"
     printf '%s\n' "$out" > "$f"
-    if ! allow_reload_sidecar "$sc" "$gen"; then
+    # Both halves have to hold: the sidecar sees this exact policy, and only
+    # then is it told to rebuild from it. Confirming the restart alone would
+    # confirm the wrong thing.
+    if ! allow_await_visible "$sc" "$out" || ! allow_reload_sidecar "$sc" "$gen"; then
         printf '%s\n' "$prev" > "$f"
         die "allow: $sc never confirmed the reload, so the change was rolled back — see 'docker logs $sc'"
     fi

@@ -111,6 +111,14 @@ sleep 3
 boxy allow ltd example.com >/dev/null 2>&1
 assert_eq "the newly allowed domain is reachable at once" "200" \
     "$(bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 20 http://example.com/')"
+# The invariant behind that: when `boxy allow` returns, the policy the sidecar
+# is ENFORCING is the one just written — not merely a proxy that restarted.
+# A bind-mounted write is not instantly visible inside the container on Docker
+# Desktop, so signalling immediately used to let the supervisor rebuild from
+# the old file, bump its generation, and report a healthy reload of the wrong
+# policy. Checking the compiled filter is the direct way to say otherwise.
+assert_eq "and the compiled filter really holds it" "1" \
+    "$(docker exec boxy-sidecar-ltd grep -c '^\^(\.\*\\\.)?example\\\.com\$' /etc/tinyproxy/filter)"
 assert_eq "a domain already allowed still is" "200" \
     "$(bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 25 https://pypi.org/simple/')"
 wait "$ALLOW_BG" 2>/dev/null

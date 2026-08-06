@@ -528,8 +528,8 @@ boxy allow web                    # print what it may currently reach
 boxy allow web --reload           # replace from ~/.config/boxy/allowlist.txt
 ```
 
-It takes effect in about a third of a second, and **live ssh sessions and port
-forwards are not disturbed** — which is the whole difficulty, since an isolated
+It takes effect in about three quarters of a second, and **live ssh sessions and
+port forwards are not disturbed** — which is the whole difficulty, since an isolated
 box's ssh port is carried by socat inside that same sidecar and restarting the
 container drops every session it is holding. `boxy allow` never writes to
 `~/.config/boxy/allowlist.txt`; a grant applies to that one box until you
@@ -555,8 +555,20 @@ So the sidecar's PID 1 is the entrypoint script acting as a supervisor, rather
 than tinyproxy itself: on `SIGHUP` it rebuilds the filter and restarts *only*
 tinyproxy, leaving the socat listeners — and the ssh sessions riding them —
 untouched. It bumps a counter at `/run/boxy-proxy-generation` each time, which
-`boxy allow` reads before and after signalling, so a reload is confirmed rather
-than assumed.
+`boxy allow` reads before and after signalling, so the restart is confirmed
+rather than assumed.
+
+The counter alone is not enough, though, and the reason is worth knowing if you
+ever build something similar. A bind-mounted write is **not instantly visible
+inside the container** on Docker Desktop, where the mount crosses a virtual
+filesystem into the VM rather than being the same kernel's page cache —
+measured here as usually visible on the first read, occasionally not for the
+better part of a second. Signalling immediately therefore let the supervisor
+rebuild the filter from the *old* file, bump its generation, and report a
+perfectly healthy reload of a policy nobody asked for. The counter could not
+catch that: it confirms a restart happened, not that the restart read what you
+wrote. So `boxy allow` waits until the sidecar can see the exact policy it
+just wrote, and only then signals.
 
 Two consequences of the sidecar's PID 1 being a shell are worth naming. It
 needs `CAP_KILL`, because tinyproxy drops to its own user and signalling
