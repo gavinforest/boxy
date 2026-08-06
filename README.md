@@ -31,8 +31,10 @@ boxyboy@boxy-2:/work$
 ./boxy ssh boxy-1
 ```
 
-Put `boxy` on your `PATH` (a symlink is fine — it resolves its own directory
-to find the `Dockerfile` and `docker/` directory alongside it):
+Put `boxy` on your `PATH`. A symlink is fine: boxy follows the link back to
+the real file before deciding where its own `Dockerfile`, `docker/` and
+`boxy.conf.example` live, so `boxy build` and `boxy config --init` read them
+from the repository rather than from wherever the link happens to sit.
 
 ```bash
 ln -s "$PWD/boxy" /usr/local/bin/boxy
@@ -103,13 +105,16 @@ container name is the box name.
 
 | Command                     | Wraps               | Why bother                                                                                                      |
 | --------------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `boxy exec [NAME] [CMD]`    | `docker exec`       | Sets the box user, `$HOME` and `/work`; works when SSH is broken. Needs a terminal only for the no-command form |
+| `boxy exec [NAME] [-- CMD]` | `docker exec`       | Sets the box user, `$HOME` and `/work`; works when SSH is broken. Needs a terminal only for the no-command form |
 | `boxy logs [NAME] [-f]`     | `docker logs`       | The entrypoint's setup narration — the first place to look when a box misbehaves                                |
 | `boxy start\|stop\|restart` | `docker start/stop` | Moves the sidecar with the box, and waits for SSH to answer before returning                                     |
 | `boxy top [--watch]`        | `docker stats`      | Filters to boxy-managed containers                                                                              |
 
 The name may be omitted whenever exactly one box exists. Proxy sidecars don't
-count toward that — a single `--net limited` box still lets you omit it.
+count toward that — a single `--net limited` box still lets you omit it. That
+holds for the passthroughs too: a leading `-f` or `--tail` is read as docker's
+flag rather than as a box name, and `boxy exec -- CMD` separates a command
+from a name you left out, exactly as `boxy ssh -- CMD` does.
 
 ### `boxy create`
 
@@ -124,6 +129,30 @@ One positional argument says what lands in `/work`:
 
 `worktree` is a keyword. If you have a directory actually named `worktree`,
 write `./worktree`.
+
+**A create that fails cleans up after itself.** Everything up to port planning
+only reads; past that, a failure can have already made a git worktree and its
+branch, a scratch directory, and a state directory holding the sudo password.
+All of it is undone, and boxy says so:
+
+```
+$ boxy create worktree -n web --net limited
+adding worktree boxy/web to /Users/you/code/thing
+Error response from daemon: all predefined address pools have been fully subnetted
+warning: create failed; undoing what it had already made
+  removed the worktree and branch boxy/web
+```
+
+The one thing it will not undo is work: the worktree is retired with plain
+`git worktree remove`, which refuses on uncommitted changes, and the branch is
+deleted only while it still points at the commit it was created from. A
+directory you named with a path target is never touched — boxy did not make it.
+
+That particular error is worth knowing about, because it is the failure you are
+most likely to meet: each `--net none` or `--net limited` box gets its own
+Docker network, and Docker's default address pools run out somewhere around
+**two to three dozen** of them. `docker network prune` reclaims any that
+outlived their boxes.
 
 ```
 -b, --ref REF         commit-ish the worktree branches from (default: HEAD)
@@ -180,7 +209,9 @@ boxy env boxy-1 --unset REGION                    # remove
 ```
 
 Sets environment variables within the box. Visible to `ssh box cmd`, an interactive `ssh box`, and `boxy exec` alike, and
-they survive `boxy stop` / `boxy start`.
+they survive `boxy stop` / `boxy start`. Listing works on a stopped box too —
+the variables live in the container's filesystem, so boxy reads them out with
+`docker cp` rather than needing anything running to ask.
 
 It is one file in the box, `/etc/boxy-env`, holding one `KEY=VALUE` per line. They're readable by processes in the following way:
 

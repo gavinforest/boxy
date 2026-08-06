@@ -14,7 +14,29 @@
 set -euo pipefail
 
 BOXY_VERSION="1.0.0"
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Where boxy's own files are — the Dockerfile, docker/, boxy.conf.example.
+#
+# BASH_SOURCE is the path bash was INVOKED with, not the file it opened, and
+# boxy is meant to be symlinked onto PATH. Taking its dirname directly pointed
+# at the symlink's directory, so `boxy build` looked for the Dockerfile in
+# /usr/local/bin and `boxy config --init` could not find the example config —
+# the two commands that need these files, and the only two that broke.
+#
+# Followed by hand rather than with `readlink -f`, which macOS does not have.
+# The loop needs no cycle guard: the kernel refused to execute this script at
+# all if its own symlink chain looped, so every link below is known to resolve.
+_boxy_self="${BASH_SOURCE[0]}"
+while [ -L "$_boxy_self" ]; do
+    _boxy_link="$(readlink "$_boxy_self")"
+    case "$_boxy_link" in
+        # A relative link resolves against the directory the LINK sits in.
+        /*) _boxy_self="$_boxy_link" ;;
+        *)  _boxy_self="$(cd "$(dirname "$_boxy_self")" && pwd)/$_boxy_link" ;;
+    esac
+done
+SELF_DIR="$(cd "$(dirname "$_boxy_self")" && pwd)"
+unset _boxy_self _boxy_link
 
 # ===========================================================================
 # Configuration
@@ -596,12 +618,87 @@ cmd_create() {
     if ! create_parse_args "$@"; then return 0; fi
     create_validate
     create_plan_ports
+
+    # Everything up to here only reads. From create_prepare_dirs on, a failure
+    # can leave real artifacts behind — a git worktree and its branch, a
+    # scratch directory, a state directory holding the sudo password — and the
+    # stages between here and create_launch can all fail: `docker network
+    # create` runs out of address pools after a couple of dozen isolated boxes,
+    # and the sidecar's `docker run` can fail for any of docker's own reasons.
+    #
+    # An EXIT trap rather than checks at each call site, because failures here
+    # arrive as die() or as `set -e`, neither of which returns to this function.
+    NB_ROLLBACK=1
+    trap create_rollback EXIT
     create_prepare_dirs
     create_prepare_password
     create_prepare_network
     create_assemble_run_args
     create_launch
+    NB_ROLLBACK=0
+    trap - EXIT
+
     create_report
+}
+
+# Undo a create that failed partway. Runs from an EXIT trap, so it must not
+# assume how far the pipeline got — every step is guarded by whether the thing
+# it removes was actually recorded.
+#
+# What it will not touch: a directory you named with a path target. That is
+# yours, it existed before boxy ran, and nothing here created it.
+create_rollback() {
+    local rc=$?
+    [ "${NB_ROLLBACK:-0}" = "1" ] || return 0
+    NB_ROLLBACK=0
+
+    warn "create failed; undoing what it had already made"
+
+    # Every step here is `|| true`. This runs under `set -e` from a trap, and a
+    # cleanup that stops halfway because one of the things it was tidying was
+    # already gone is worse than no cleanup at all.
+    if [ -n "$NB_NAME" ]; then docker rm -f "$NB_NAME" >/dev/null 2>&1 || true; fi
+    if [ -n "$NB_SIDECAR_NAME" ]; then docker rm -f "$NB_SIDECAR_NAME" >/dev/null 2>&1 || true; fi
+    if [ "$NB_NET" != "full" ] && [ -n "$NB_NET_NAME" ]; then
+        remove_network_if_unused "$NB_NET_NAME" || true
+    fi
+
+    # The worktree and its branch. `git worktree remove` WITHOUT --force is
+    # the same interlock `boxy rm` uses: it refuses on uncommitted changes, so
+    # in the one case where something did get written the tree is reported and
+    # left alone rather than discarded by a cleanup path.
+    if [ "$NB_SOURCE" = "worktree" ] && [ -n "$NB_WT_BRANCH" ] && [ -d "$NB_WT_REPO" ]; then
+        if git -C "$NB_WT_REPO" worktree remove "$NB_WORKDIR" >/dev/null 2>&1; then
+            # Delete the branch only while it still points where it was
+            # created, which is proof nothing was committed onto it.
+            if [ "$(git -C "$NB_WT_REPO" rev-parse --verify --quiet "$NB_WT_BRANCH" 2>/dev/null)" \
+                 = "$NB_WT_START" ]; then
+                git -C "$NB_WT_REPO" branch -D "$NB_WT_BRANCH" >/dev/null 2>&1 || true
+                note "  removed the worktree and branch $NB_WT_BRANCH"
+            else
+                note "  removed the worktree; branch $NB_WT_BRANCH has commits and was kept"
+            fi
+        else
+            note "  worktree at $NB_WORKDIR has changes and was left in place"
+        fi
+    fi
+
+    # A scratch workdir boxy made itself, and only under the base it makes them
+    # in. Deliberately NOT the worktree case: `git worktree remove` deletes the
+    # directory when it succeeds, and when it refuses the directory is the
+    # thing being preserved — an rm here would discard exactly the changes the
+    # interlock above just declined to throw away.
+    if [ "$NB_SOURCE" = "scratch" ]; then
+        case "$NB_WORKDIR" in
+            "$BOXY_WORKDIR_BASE"/*) rm -rf "$NB_WORKDIR" 2>/dev/null || true ;;
+        esac
+    fi
+
+    case "$NB_SDIR" in
+        "$BOXY_STATE_DIR"/instances/*) rm -rf "$NB_SDIR" 2>/dev/null || true ;;
+    esac
+
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -614,7 +711,8 @@ cmd_create() {
 # at the start of every run so nothing leaks between invocations.
 nb_reset() {
     NB_TARGET=""; NB_SOURCE=""; NB_MOUNT_DIR=""; NB_REF=""; NB_NAME=""
-    NB_WT_REPO=""; NB_WT_GITDIR=""; NB_WT_BRANCH=""
+    NB_WT_REPO=""; NB_WT_GITDIR=""; NB_WT_BRANCH=""; NB_WT_START=""
+    NB_ROLLBACK=0
     NB_PASSWORD=""; NB_PW_HASH=""; NB_PW_GENERATED=0
     NB_USER="$BOXY_USER"; NB_PUBKEY=""
     NB_NET="$BOXY_NET"; NB_IMAGE="$BOXY_IMAGE"
@@ -840,6 +938,9 @@ create_prepare_dirs() {
             info "adding worktree $NB_WT_BRANCH to $NB_WT_REPO"
             # git is happy to populate an existing empty directory, which is
             # what mktemp -d just handed us.
+            # Recorded so create_rollback can tell "this branch is untouched"
+            # from "something was committed onto it" and only delete the former.
+            NB_WT_START="$(git -C "$NB_WT_REPO" rev-parse "${NB_REF:-HEAD}^{commit}")"
             git -C "$NB_WT_REPO" worktree add --quiet \
                 -b "$NB_WT_BRANCH" "$NB_WORKDIR" "${NB_REF:-HEAD}" \
                 || die "git worktree add failed"
@@ -1076,14 +1177,14 @@ create_assemble_run_args() {
 }
 
 create_launch() {
-    if ! docker run "${RUN_ARGS[@]}" "$NB_IMAGE" >/dev/null; then
-        # Roll back anything this run created, so a failed create does not
-        # leave a half-built box behind.
-        [ -n "$NB_SIDECAR_NAME" ] && docker rm -f "$NB_SIDECAR_NAME" >/dev/null 2>&1
-        [ "$NB_NET" != "full" ] && remove_network_if_unused "$NB_NET_NAME"
-        die "docker run failed"
-    fi
+    # No cleanup here: the EXIT trap armed in cmd_create covers this failure
+    # along with every other one after create_prepare_dirs, and covers more
+    # than this ever did — the worktree and the state directory included.
+    docker run "${RUN_ARGS[@]}" "$NB_IMAGE" >/dev/null || die "docker run failed"
 
+    # A box that starts but does not answer SSH in time is NOT a failed create.
+    # It exists, `boxy exec` reaches it, and its logs are the thing worth
+    # reading — so this warns and returns rather than rolling the box back.
     if ! wait_for_ready "$NB_NAME"; then
         warn "the box did not become SSH-reachable within the timeout. Recent logs:"
         docker logs --tail 30 "$NB_NAME" >&2 || true
@@ -1458,7 +1559,15 @@ env_key_ok() {
     printf '%s' "$1" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'
 }
 
-box_env_read() { docker exec "$1" cat "$BOXY_ENV_FILE" 2>/dev/null || true; }
+# `docker cp` rather than `docker exec`, because it reads a STOPPED box too.
+# The variables live in the container filesystem and survive a restart — which
+# is what boxy tells you when it sets them — so answering "no variables set"
+# for a stopped box was a plain untruth, and exactly the one you would go and
+# check. `docker cp PATH -` writes a tar to stdout; -xO unpacks it to stdout.
+# Both halves stay quiet about a missing file, which is the empty-file case.
+box_env_read() {
+    docker cp "$1:$BOXY_ENV_FILE" - 2>/dev/null | tar -xO 2>/dev/null || true
+}
 
 # Over stdin, so a value never passes through a shell on the way in. There is
 # nothing to quote and nothing to escape.
@@ -1706,8 +1815,13 @@ cmd_ssh() {
 
 cmd_exec() {
     require_docker
+    # `boxy exec -- CMD` with a single box: the -- is a separator, not a name.
+    # Same rule `boxy ssh` has always had. Without it there was no way to omit
+    # the name here at all — `boxy exec 'ls /work'` read the command as the box.
+    if [ "${1:-}" = "--" ]; then shift; set -- "" "$@"; fi
     local name; name="$(resolve_instance "${1:-}")"
     shift || true
+    if [ "${1:-}" = "--" ]; then shift; fi
     local user home
     user="$(inst_label "$name" boxy.user)"
 
@@ -1825,8 +1939,16 @@ cmd_restart() { cmd_stop "$@"; cmd_start "$@"; }
 
 cmd_logs() {
     require_docker
-    local name; name="$(resolve_instance "${1:-}")"
-    shift || true
+    # A leading option is docker's, not a box name. Without this check the
+    # documented `boxy logs -f` — the name omitted, as it may be whenever one
+    # box exists — resolved "-f" as an instance and died with "no such
+    # instance: -f".
+    local name=""
+    case "${1:-}" in
+        -*) ;;
+        *)  name="${1:-}"; shift || true ;;
+    esac
+    name="$(resolve_instance "$name")"
     exec docker logs "$@" "$name"
 }
 

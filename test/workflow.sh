@@ -153,6 +153,8 @@ assert_eq "conda is on PATH here too" "/opt/conda/bin/python" \
 # blocks forever, so this must fail with a reason rather than hang.
 assert_contains "no command and no tty fails fast" "needs a terminal" \
     "$(boxy exec boxy-1 < /dev/null 2>&1)"
+assert_eq "-- is a separator, not part of the command" "named-ok" \
+    "$(boxy exec boxy-1 -- 'echo named-ok' 2>&1)"
 
 section "a default workdir is scratch space in the OS temp area"
 boxy create -n scratch1 >/dev/null 2>&1
@@ -193,6 +195,15 @@ boxy create -n onlybox --net limited >/dev/null 2>&1
 assert_eq "two managed containers exist" "2" \
     "$(docker ps -aq --filter 'label=boxy.managed=1' | grep -c .)"
 assert_contains "but the name is still optional" "onlybox" "$(boxy info 2>&1)"
+# The passthroughs have to honour name-omission too, and both had their own
+# way of not doing so: `logs` read a leading option as the box name, and
+# `exec` read the command word as one.
+assert_eq "exec: -- separates a command from an omitted name" "sep-ok" \
+    "$(boxy exec -- 'echo sep-ok' 2>&1)"
+assert_contains "logs: a leading -f is docker's flag, not a box name" "boxy" \
+    "$(boxy logs --tail 5 2>&1)"
+assert_contains "logs: and an unknown name is still an error" "no such instance" \
+    "$(boxy logs nosuchbox --tail 5 2>&1)"
 boxy rm onlybox >/dev/null 2>&1
 
 section "messages when the name cannot be inferred"
@@ -218,6 +229,16 @@ assert_contains "and it lists" "REGION=us-east-1" "$(boxy env envb)"
 # before reaching it.
 assert_contains "the loader is sourced from the boxy block" "boxy-env.sh" \
     "$(docker exec envb head -4 /home/boxyboy/.bashrc)"
+
+section "env reads a stopped box, because that is where the variables are"
+# Read with `docker cp`, not `docker exec`. The exec route cannot reach a
+# stopped container, and its failure used to be swallowed into an empty
+# string — so a stopped box reported "no variables set" while holding them,
+# contradicting the "they survive a restart" boxy prints when setting one.
+boxy stop envb >/dev/null 2>&1
+assert_contains "a stopped box still lists what it holds" "API_KEY=secret123" \
+    "$(boxy env envb)"
+boxy start envb >/dev/null 2>&1
 
 section "env survives a restart with no host state"
 # Nothing is replayed on start: the file lives in the container, and the

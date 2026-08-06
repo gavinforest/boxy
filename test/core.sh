@@ -163,6 +163,45 @@ assert_contains "and info still reports it honestly" "enforced by docker" \
     "$(boxy info ptiso)"
 boxy rm ptiso >/dev/null 2>&1
 
+section "boxy works when it is symlinked onto PATH"
+# BASH_SOURCE is the path bash was invoked with, not the file it opened, so
+# taking its dirname pointed at the symlink's directory. `boxy build` then
+# looked for the Dockerfile in /usr/local/bin and `config --init` could not
+# find the bundled example — the only two commands that read boxy's own files.
+mkdir -p "$TEST_TMP/bin"
+ln -sf "$BOXY" "$TEST_TMP/bin/boxy-link"
+ln -sf boxy-link "$TEST_TMP/bin/boxy-relative"     # relative, and a second hop
+assert_contains "an absolute symlink finds the example config" "wrote" \
+    "$(BOXY_CONFIG_DIR="$TEST_TMP/symcfg1" "$TEST_TMP/bin/boxy-link" config --init 2>&1)"
+assert_contains "so does a relative link to a link" "wrote" \
+    "$(BOXY_CONFIG_DIR="$TEST_TMP/symcfg2" "$TEST_TMP/bin/boxy-relative" config --init 2>&1)"
+rm -rf "$TEST_TMP/bin" "$TEST_TMP/symcfg1" "$TEST_TMP/symcfg2"
+
+section "a create that fails partway undoes what it had made"
+# The stages after create_prepare_dirs can all fail — docker runs out of
+# address pools after a couple of dozen isolated boxes — and until an EXIT
+# trap covered them a failure left a git worktree, its branch, and a state
+# directory holding the sudo password behind, under a bare docker error.
+#
+# Forced here by taking the container name the sidecar wants, so the
+# sidecar's `docker run` fails for a reason that needs no pool exhaustion.
+RBREPO="$TEST_TMP/rbrepo"
+rm -rf "$RBREPO"; mkdir -p "$RBREPO"
+( cd "$RBREPO" && git init -q && git config user.email t@example.com \
+    && git config user.name Tester && git commit -q --allow-empty -m base ) >/dev/null 2>&1
+# `docker create`, not run: reserving the name is all that is needed, and a
+# container that never starts costs nothing to clean up.
+docker create --name boxy-sidecar-rb boxy:latest >/dev/null 2>&1
+out="$( cd "$RBREPO" && boxy create worktree -n rb --net none 2>&1 )"
+assert_contains "it says it is undoing the work" "undoing what it had already made" "$out"
+assert_empty "the state directory is gone" \
+    "$(ls -d "$BOXY_STATE_DIR/instances/rb" 2>/dev/null)"
+assert_eq "the worktree is deregistered" "1" \
+    "$(git -C "$RBREPO" worktree list | grep -c .)"
+assert_empty "and the branch it created is gone" \
+    "$(git -C "$RBREPO" branch --list 'boxy/rb')"
+docker rm -f boxy-sidecar-rb >/dev/null 2>&1
+
 section "container names are validated before any work happens"
 assert_contains "one-character name refused up front" "not a usable container name" \
     "$(boxy create -n z 2>&1)"
