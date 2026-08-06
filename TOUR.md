@@ -298,7 +298,7 @@ The stack:
   jax      0.11.0 backend: cpu | devices: [CpuDevice(id=0)]
   numpy    2.5.1  scipy 1.18.0  pandas 3.0.5
   polars   1.43.2  sklearn 1.9.0
-
+TODO: add gomp here
   marimo      0.23.16
   jupyter-lab 4.6.2
   node        v26.5.1

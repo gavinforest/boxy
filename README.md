@@ -770,7 +770,7 @@ The default build, by where each package comes from:
 | --- | --- |
 | apt | `git` · `git-lfs` · `tmux` · `htop` · `jq` · `ripgrep` · `fd-find` · `rsync` · `build-essential` · `openssh-server` · `sudo` |
 | conda-forge | `python` · `numpy` · `scipy` · `pandas` · `matplotlib-base` · `ipython` · `nodejs` |
-| pip | `jax[cpu]` · `marimo` · `tqdm` · `rich` · `httpx` · `uv` |
+| pip | `jax[cpu]` · `marimo` · `tqdm` · `rich` · `httpx` · `uv` . `gomp`|
 | bundled | `conda` / `mamba` (from the Miniforge installer) |
 
 `fd-find` installs its binary as **`fdfind`** on Debian, not `fd`.

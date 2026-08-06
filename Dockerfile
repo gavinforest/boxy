@@ -43,42 +43,42 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # it through this image, so the plaintext never needs a shell argument or an
 # openssl that may or may not support -6 on the host.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server \
-        sudo \
-        tini \
-        ca-certificates \
-        curl \
-        wget \
-        git \
-        git-lfs \
-        gnupg \
-        whois \
-        less \
-        vim-tiny \
-        nano \
-        tmux \
-        htop \
-        procps \
-        psmisc \
-        rsync \
-        unzip \
-        zip \
-        bzip2 \
-        xz-utils \
-        jq \
-        ripgrep \
-        fd-find \
-        tree \
-        file \
-        build-essential \
-        pkg-config \
-        iproute2 \
-        iptables \
-        iputils-ping \
-        netcat-openbsd \
-        dnsutils \
-        socat \
-        locales \
+    openssh-server \
+    sudo \
+    tini \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    git-lfs \
+    gnupg \
+    whois \
+    less \
+    vim-tiny \
+    nano \
+    tmux \
+    htop \
+    procps \
+    psmisc \
+    rsync \
+    unzip \
+    zip \
+    bzip2 \
+    xz-utils \
+    jq \
+    ripgrep \
+    fd-find \
+    tree \
+    file \
+    build-essential \
+    pkg-config \
+    iproute2 \
+    iptables \
+    iputils-ping \
+    netcat-openbsd \
+    dnsutils \
+    socat \
+    locales \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # image size — layers are copy-on-write per file, and a metadata change counts.
 RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
     && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home \
-        --shell /bin/bash "${USERNAME}" \
+    --shell /bin/bash "${USERNAME}" \
     && usermod -aG sudo "${USERNAME}" \
     && install -d -m 700 -o "${USER_UID}" -g "${USER_GID}" /home/"${USERNAME}"/.ssh \
     && install -d -m 755 -o "${USER_UID}" -g "${USER_GID}" "${CONDA_DIR}" \
@@ -129,12 +129,12 @@ ENV HOME=/home/${USERNAME}
 # ownership. Without -u the installer refuses a non-empty-looking target.
 RUN set -eux; \
     case "${TARGETARCH}" in \
-        amd64) MF_ARCH=x86_64 ;; \
-        arm64) MF_ARCH=aarch64 ;; \
-        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    amd64) MF_ARCH=x86_64 ;; \
+    arm64) MF_ARCH=aarch64 ;; \
+    *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/miniforge.sh \
-        "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-${MF_ARCH}.sh"; \
+    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-${MF_ARCH}.sh"; \
     bash /tmp/miniforge.sh -b -u -p "${CONDA_DIR}"; \
     rm -f /tmp/miniforge.sh; \
     "${CONDA_DIR}/bin/conda" config --system --set auto_update_conda false; \
@@ -157,25 +157,26 @@ ENV PATH=${CONDA_DIR}/bin:${PATH}
 # savefig() and marimo/notebook rendering are unaffected.
 RUN set -eux; \
     mamba install -y -n base -c conda-forge \
-        "python=${PYTHON_VERSION}" \
-        numpy \
-        scipy \
-        pandas \
-        matplotlib-base \
-        ipython \
-        nodejs \
-        pip \
+    "python=${PYTHON_VERSION}" \
+    numpy \
+    scipy \
+    pandas \
+    matplotlib-base \
+    ipython \
+    nodejs \
+    pip \
     ; \
     mamba clean -afy
 
 RUN set -eux; \
     pip install --no-cache-dir \
-        "jax[cpu]" \
-        marimo \
-        tqdm \
-        rich \
-        httpx \
-        uv \
+    "jax[cpu]" \
+    marimo \
+    tqdm \
+    rich \
+    httpx \
+    uv \
+    gomp \
     ; \
     rm -rf "$HOME/.cache/pip"
 
@@ -184,8 +185,8 @@ RUN set -eux; \
 # in only pays off if you want them in every box.
 RUN set -eux; \
     if [ "${INSTALL_EXTRAS}" = "1" ]; then \
-        pip install --no-cache-dir jupyterlab polars pyarrow scikit-learn; \
-        rm -rf "$HOME/.cache/pip"; \
+    pip install --no-cache-dir jupyterlab polars pyarrow scikit-learn; \
+    rm -rf "$HOME/.cache/pip"; \
     fi
 
 # Optional: Claude Code inside the box, for when you want an agent working
@@ -194,13 +195,13 @@ RUN set -eux; \
 # sudo and no root-owned files in the tree.
 RUN set -eux; \
     if [ "${INSTALL_CLAUDE_CODE}" = "1" ]; then \
-        npm install -g @anthropic-ai/claude-code; \
-        npm cache clean --force; \
+    npm install -g @anthropic-ai/claude-code; \
+    npm cache clean --force; \
     fi
 
 RUN "${CONDA_DIR}/bin/conda" init bash \
     && echo '. /opt/conda/etc/profile.d/conda.sh && conda activate base' \
-        >> "$HOME/.bashrc"
+    >> "$HOME/.bashrc"
 
 # ---------------------------------------------------------------------------
 # Back to root for the pieces the entrypoint needs
