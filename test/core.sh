@@ -64,6 +64,17 @@ assert_contains "a dirty tree is marked dirty" "✗" \
 # stub, every prompt draw would expand to a "command not found".
 assert_eq "ruby_prompt_info is stubbed, not missing" "" \
     "$(bssh boxy-1 'zsh -ic "ruby_prompt_info"')"
+# The box name is the point of the whole segment: it is what distinguishes a
+# box prompt from the host's, and one box from another. It reaches the shell
+# through pam_env, so this breaks silently if /etc/environment stops carrying
+# BOXY_NAME.
+assert_contains "the prompt names the box" "boxy-1" \
+    "$(bssh boxy-1 'zsh -ic "print -rP -- \${(e)PROMPT}"')"
+# conda's own changeps1 is off, so the env marker is rendered from
+# CONDA_DEFAULT_ENV by docker/zshrc. If that regressed, the box name would
+# still show and only the env would quietly vanish.
+assert_contains "and the active conda env, after it" "(base)" \
+    "$(bssh boxy-1 'zsh -ic "print -rP -- \${(e)PROMPT}"')"
 
 section "the scientific stack"
 assert_contains "numpy/scipy/jax import and compute" "jax-ok" \

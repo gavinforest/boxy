@@ -37,3 +37,28 @@ git_prompt_info() {
 ruby_prompt_info() { : }
 
 source /etc/zsh/crunch-custom.zsh-theme
+
+# conda's own prompt handling is switched off in the image (changeps1 false),
+# so the env marker is placed here instead. That is what lets the box name sit
+# to the LEFT of it: conda prepends to PROMPT when it activates, which happens
+# after this file has run, and would otherwise always take the leftmost slot.
+#
+# Built from CONDA_DEFAULT_ENV rather than CONDA_PROMPT_MODIFIER, because
+# changeps1 false leaves the latter exported but empty.
+#
+# Single-quoted on purpose. prompt_subst re-expands it at every draw, so
+# `conda activate` in a live session still updates the prompt.
+PROMPT='${CONDA_DEFAULT_ENV:+($CONDA_DEFAULT_ENV) }'"$PROMPT"
+
+# Which box you are in, first thing on the line.
+#
+# A host prompt looks nothing like this one, but that is a convention rather
+# than a guarantee, and with several boxes open in adjacent tabs the name is
+# the only thing that tells them apart. Magenta because the rest of the prompt
+# has already claimed yellow, cyan, green and white.
+#
+# $BOXY_NAME reaches an SSH session through pam_env, which reads the block
+# docker/entrypoint.sh writes into /etc/environment. Guarded so a zsh started
+# outside that context does not render a bare colon with no name before it.
+[[ -n "$BOXY_NAME" ]] \
+    && PROMPT="%{$fg[magenta]%}${BOXY_NAME}:%{$reset_color%} $PROMPT"

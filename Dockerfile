@@ -229,7 +229,13 @@ COPY --chown=${USER_UID}:${USER_GID} docker/zshrc /home/${USERNAME}/.zshrc
 # conda init zsh appends its own managed block, so the activate line goes on
 # last — otherwise conda's block would land after the activation and the base
 # env would not be on PATH in an interactive shell.
+# changeps1 belongs to the prompt rather than to the conda install, so it is
+# set here and not up with the other conda config — which also keeps the long
+# mamba and pip layers out of the rebuild whenever the prompt changes.
+# docker/zshrc renders $CONDA_PROMPT_MODIFIER itself; without this conda would
+# prepend a second copy, ahead of the box name.
 RUN set -eux; \
+    "${CONDA_DIR}/bin/conda" config --system --set changeps1 false; \
     "${CONDA_DIR}/bin/conda" init zsh; \
     echo '. /opt/conda/etc/profile.d/conda.sh && conda activate base' \
     >> "$HOME/.zshrc"

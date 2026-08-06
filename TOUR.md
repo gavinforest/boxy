@@ -797,7 +797,7 @@ working, but it normalises to `docker-default`.
 ```
 
 ```
-core: 71 passed, 0 failed
+core: 73 passed, 0 failed
 network: 65 passed, 0 failed
 workflow: 114 passed, 0 failed
 
@@ -809,7 +809,7 @@ workflow: 114 passed, 0 failed
 all suites passed
 ```
 
-250 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
+252 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
 under `$TMPDIR` with their own keypair, so they cannot touch a real install or
 your `~/.ssh` — though they *do* remove every boxy-managed container on the
 host, since a shared Docker daemon is the one resource they cannot sandbox.

@@ -801,11 +801,23 @@ The default build, by where each package comes from:
 ### The shell
 
 The box user's login shell is **zsh**, so `boxy ssh` lands in it, with the
-`crunch` prompt — time, working directory, git branch and a clean/dirty mark:
+`crunch` prompt — box name, conda env, time, working directory, git branch and
+a clean/dirty mark:
 
 ```
-(base) {14:22} /work:boxy/web ✓ $
+web: (base) {14:22} /work:boxy/web ✓ $
 ```
+
+The **box name comes first**, in magenta, because a prompt that looks like a
+host prompt is how you end up running something in the wrong place — and with
+two boxes open in adjacent tabs it is the only thing that tells them apart. It
+comes from `$BOXY_NAME`, which reaches the shell through `sshd`'s pam_env.
+
+conda's own `changeps1` is switched off in the image and the `(base)` marker is
+rendered by `docker/zshrc` from `$CONDA_DEFAULT_ENV`. Otherwise conda would
+prepend it at activation — which happens after `.zshrc` runs — and would always
+take the leftmost slot ahead of the box name. It still tracks
+`conda activate` live.
 
 There is no oh-my-zsh. The theme needs three things from it — a colour table,
 `git_prompt_info` and `ruby_prompt_info` — and `docker/zshrc` defines them in a
