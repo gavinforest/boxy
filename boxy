@@ -1294,6 +1294,14 @@ create_report() {
             "$C_BLD" "$C_OFF" "$C_DIM" "$NB_NAME" "$C_OFF" "$BOXY_PORTS"
     fi
     write_ssh_config >/dev/null
+    # Keep the shared known_hosts current, but only once you have opted in.
+    # Without this the file is only ever as fresh as the last time you ran
+    # `ssh-config --known-hosts` by hand, which is exactly how a new box
+    # inherits a dead one's key on a reused port.
+    if known_hosts_managed; then
+        known_hosts_prune_stale
+        known_hosts_install "$NB_NAME"
+    fi
 }
 
 container_running() {
@@ -1389,20 +1397,309 @@ write_ssh_config() {
     printf '%s\n' "$out"
 }
 
+# ---------------------------------------------------------------------------
+# known_hosts
+# ---------------------------------------------------------------------------
+# boxy's own known_hosts is per-instance and reached only through `ssh -F` (see
+# write_ssh_config). That is deliberate: it gives real host-key checking while
+# writing nothing into the shared file, so a reused port can never leave a
+# stale key behind to fail against the next box that lands on it.
+#
+# It also assumes every client parses ssh_config, and plenty do not. Clients
+# built on Go's crypto/ssh and its equivalents read the keywords they need to
+# dial — HostName, Port, User, IdentityFile — and ignore UserKnownHostsFile, so
+# they look the host up in ~/.ssh/known_hosts, find nothing, and refuse the
+# connection in their own wording. `--known-hosts` is the opt-in for those.
+#
+# Every line boxy writes there carries a trailing `boxy:NAME` comment, which is
+# what makes removal exact. Not "delete anything on port 2200", which would
+# take an entry you added yourself; and not a key comparison, which would need
+# the instance state dir to still exist — `boxy rm` deletes that before it is
+# finished, and a force-removed container never had a teardown at all.
+known_hosts_file() { printf '%s\n' "$HOME/.ssh/known_hosts"; }
+
+known_hosts_backup_file() { printf '%s\n' "$(known_hosts_file).boxy-backup"; }
+
+# The single gate every mutation in this section goes through.
+#
+# known_hosts is the file ssh consults to tell your box from an impostor, and
+# nothing backs it up. So this does not trust the filter that produced the
+# candidate — it audits the RESULT against one invariant:
+#
+#     boxy may only add or remove lines carrying its own `boxy:` marker.
+#
+# Checking the outcome rather than the mechanism is the point. A filter that
+# half-ran, an instance name with a character the matching mishandles, an awk
+# that failed for a reason nobody predicted — all of them show up here as lines
+# changing that boxy does not own, and all of them are refused identically.
+# There is no path from a bug in this section to a host key going missing.
+#
+# $3 is the filter's exit status and is required: a failed awk leaves an EMPTY
+# candidate, and copying that over the real file is total data loss.
+known_hosts_commit() {
+    local f="$1" cand="$2" rc="$3" bad=0 n bak
+
+    if [ "$rc" != "0" ]; then
+        rm -f "$cand"
+        warn "known_hosts: filter failed — $f left unchanged"
+        return 0
+    fi
+
+    # Nothing to do. Skipping here keeps a purge with no matches from touching
+    # mtime or rolling the backup over a state worth keeping.
+    if cmp -s "$f" "$cand"; then
+        rm -f "$cand"
+        return 0
+    fi
+
+    # Lines that would vanish, then lines that would appear; each set must be
+    # entirely boxy's. `|| true` on the counts because grep exits 1 on no match,
+    # and `if` blocks rather than `[ … ] && …` because under `set -e` the latter
+    # is only safe when it is not the last statement in its branch.
+    n="$(grep -vxF -f "$cand" "$f" 2>/dev/null | grep -vc ' boxy:' || true)"
+    if [ "${n:-0}" -gt 0 ]; then bad=$(( bad + n )); fi
+    n="$(grep -vxF -f "$f" "$cand" 2>/dev/null | grep -vc ' boxy:' || true)"
+    if [ "${n:-0}" -gt 0 ]; then bad=$(( bad + n )); fi
+
+    if [ "$bad" -gt 0 ]; then
+        rm -f "$cand"
+        warn "known_hosts: refusing to write — $bad line(s) boxy does not own would change"
+        warn "  $f is exactly as it was. This is a bug in boxy; please report it."
+        return 0
+    fi
+
+    # Backed up only when something actually changes, to one stable path rather
+    # than a timestamped pile that nobody prunes.
+    bak="$(known_hosts_backup_file)"
+    cat "$f" > "$bak" 2>/dev/null || true
+    chmod 600 "$bak" 2>/dev/null || true
+
+    # Contents copied rather than mv, so the original's ownership and mode
+    # survive. Same reason the entrypoint does it that way for .bashrc.
+    cat "$cand" > "$f"
+    rm -f "$cand"
+    chmod 600 "$f"
+}
+
+# Drop every line boxy wrote for this instance. Idempotent and quiet: a file
+# that does not exist, or holds nothing of ours, is a no-op.
+#
+# Suffix-matched with awk rather than `grep -v`, because an instance name may
+# contain '.' and a regex would then match more than the name it was built
+# from.
+known_hosts_purge() {
+    local name="$1" f marker tmp rc=0
+    f="$(known_hosts_file)"
+    [ -f "$f" ] || return 0
+    marker=" boxy:$name"
+    tmp="$(mktemp)"
+    # `|| rc=$?` rather than a bare call: under `set -e` a failing awk would
+    # take the whole script down before the status could be inspected.
+    awk -v m="$marker" \
+        'substr($0, length($0) - length(m) + 1) != m' "$f" > "$tmp" || rc=$?
+    known_hosts_commit "$f" "$tmp" "$rc"
+}
+
+# Clear any boxy-written line for this host:port, whichever instance wrote it.
+# The normal path removes an instance's lines at `boxy rm`; this covers the
+# case where that never ran and the port has since been handed to a new box.
+# Only lines carrying a boxy marker are touched — an entry you added yourself
+# for something else on the same port is left alone.
+known_hosts_purge_port() {
+    local port="$1" f tmp rc=0
+    f="$(known_hosts_file)"
+    [ -f "$f" ] || return 0
+    tmp="$(mktemp)"
+    awk -v h="[127.0.0.1]:$port" \
+        '!($1 == h && $NF ~ /^boxy:/)' "$f" > "$tmp" || rc=$?
+    known_hosts_commit "$f" "$tmp" "$rc"
+}
+
+# Whether boxy is managing entries in the shared known_hosts. Set by
+# `ssh-config --known-hosts`, and the reason create and rm can keep the file
+# current without being told again every time.
+#
+# A marker file rather than a config key, because this is a fact about what
+# boxy has already done to your filesystem, not a preference — restoring a
+# config from backup should not make boxy believe it owns lines it never wrote.
+known_hosts_marker_file() { printf '%s\n' "$BOXY_STATE_DIR/known_hosts_managed"; }
+known_hosts_managed() { [ -f "$(known_hosts_marker_file)" ]; }
+
+# Drop every boxy line that no longer describes a live box.
+#
+# Name alone is not enough, and the gap is not hypothetical: `docker rm` a box
+# by hand, create another with the same name, and it lands on the same port
+# with FRESH host keys — prune_orphan_state deleted the old state dir, so the
+# entrypoint generated new ones. The name is live again, so a name-only check
+# calls the stale line valid, and every connection then fails as a host-key
+# mismatch, which reads as an attack rather than as litter.
+#
+# So a line survives only if its instance exists AND its key is that instance's
+# current key. Both halves are compared as literal strings — no regex touches
+# an instance name.
+known_hosts_prune_stale() {
+    local f tmp vf name pubfile rc=0
+    f="$(known_hosts_file)"
+    [ -f "$f" ] || return 0
+
+    # The (name, key) pairs that are currently true, one per line, in a FILE.
+    # Not `awk -v`: that assignment processes escapes and rejects a literal
+    # newline outright, so a multi-line table passed that way makes awk exit
+    # non-zero — which, before known_hosts_commit started checking status,
+    # emptied the user's known_hosts.
+    #
+    # The sentinel first line guarantees this file is never empty, which is
+    # what keeps `NR == FNR` meaning "still reading the table". Given an empty
+    # first file, awk would apply that test to the first record of the SECOND
+    # one and silently eat a real host key. `-` cannot collide with anything:
+    # create_validate requires an instance name to start alphanumeric.
+    vf="$(mktemp)"
+    printf '%s\n' "- -" > "$vf"
+    for name in $(list_instances); do
+        for pubfile in "$(state_dir_for "$name")"/hostkeys/*.pub; do
+            [ -f "$pubfile" ] || continue
+            printf '%s %s\n' "$name" "$(cut -d' ' -f2 < "$pubfile")" >> "$vf"
+        done
+    done
+
+    tmp="$(mktemp)"
+    # $1 host, $2 keytype, $3 key, $NF the boxy:NAME marker. Lines with no boxy
+    # marker pass through untouched — they are not ours to judge.
+    awk '
+        NR == FNR { ok[$1 " " $2] = 1; next }
+        $NF ~ /^boxy:/ { if (!((substr($NF, 6) " " $3) in ok)) next }
+        { print }
+    ' "$vf" "$f" > "$tmp" || rc=$?
+    rm -f "$vf"
+    known_hosts_commit "$f" "$tmp" "$rc"
+}
+
+# Remove every line boxy has written, whatever instance it belongs to and
+# whether or not that instance still exists.
+#
+# Opting out removes the lines rather than merely ceasing to update them. A
+# file boxy has stopped maintaining but still has entries in is the worst of
+# the three states: the keys go stale on their own schedule and nothing is
+# left that will ever clean them up.
+known_hosts_purge_all() {
+    local f tmp rc=0
+    f="$(known_hosts_file)"
+    [ -f "$f" ] || return 0
+    tmp="$(mktemp)"
+    awk '!($NF ~ /^boxy:/)' "$f" > "$tmp" || rc=$?
+    known_hosts_commit "$f" "$tmp" "$rc"
+}
+
+# How many lines in the shared file are boxy's. Reported rather than inferred,
+# so `--no-known-hosts` can say what it actually took out.
+known_hosts_count() {
+    local f
+    f="$(known_hosts_file)"
+    [ -f "$f" ] || { printf '0\n'; return 0; }
+    awk '$NF ~ /^boxy:/' "$f" | wc -l | tr -d ' '
+}
+
+# Add this box's host keys to the shared file, replacing anything already there
+# for it or for its port.
+known_hosts_install() {
+    local name="$1" f sdir port pubfile tmp
+    f="$(known_hosts_file)"
+    sdir="$(state_dir_for "$name")"
+    port="$(inst_label "$name" boxy.ssh_port)"
+
+    mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+    touch "$f"; chmod 600 "$f"
+
+    known_hosts_purge "$name"
+    known_hosts_purge_port "$port"
+
+    # Built as a candidate and committed, rather than appended straight to the
+    # file. Appending would be the one mutation in this section that never
+    # faced known_hosts_commit's audit, and the audit is worth more on the path
+    # that writes new key material than on the ones that only remove.
+    tmp="$(mktemp)"
+    cat "$f" > "$tmp"
+    for pubfile in "$sdir"/hostkeys/*.pub; do
+        [ -f "$pubfile" ] || continue
+        printf '[%s]:%s %s boxy:%s\n' "127.0.0.1" "$port" \
+            "$(cut -d' ' -f1,2 < "$pubfile")" "$name" >> "$tmp"
+    done
+    known_hosts_commit "$f" "$tmp" 0
+}
+
+# The Include covers ssh(1) and anything else that reads ssh_config in full.
+# It does NOT cover a client that reads the connection keywords and skips
+# UserKnownHostsFile, which fails at host-key checking with an error of its own
+# devising rather than anything recognisably about known_hosts. Naming it here
+# is the difference between a five-minute fix and an afternoon.
+ssh_config_known_hosts_hint() {
+    note "if a client still refuses the host key, it is ignoring UserKnownHostsFile —"
+    note "run 'boxy ssh-config --known-hosts' to also seed ~/.ssh/known_hosts"
+}
+
 cmd_ssh_config() {
     require_docker
-    local install=0
+    local install=0 known=0 unmanage=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --install) install=1; shift ;;
-            -h|--help) printf 'usage: boxy ssh-config [--install]\n'; return 0 ;;
+            --install)        install=1;  shift ;;
+            --known-hosts)    known=1;    shift ;;
+            --no-known-hosts) unmanage=1; shift ;;
+            -h|--help)
+                printf 'usage: boxy ssh-config [--install] [--known-hosts | --no-known-hosts]\n\n' >&2
+                printf '  --install           Include the generated config from ~/.ssh/config\n' >&2
+                printf '  --known-hosts       also add each box'"'"'s host keys to ~/.ssh/known_hosts,\n' >&2
+                printf '                      for clients that read ssh_config but ignore\n' >&2
+                printf '                      UserKnownHostsFile. create and rm then keep\n' >&2
+                printf '                      those entries current.\n' >&2
+                printf '  --no-known-hosts    stop managing ~/.ssh/known_hosts and take every\n' >&2
+                printf '                      boxy line back out of it\n' >&2
+                return 0 ;;
             *) die "ssh-config: unknown option $1" ;;
         esac
     done
 
+    if [ "$known" = "1" ] && [ "$unmanage" = "1" ]; then
+        die "ssh-config: --known-hosts and --no-known-hosts ask for opposite things"
+    fi
+
+    if [ "$unmanage" = "1" ]; then
+        local removed
+        removed="$(known_hosts_count)"
+        known_hosts_purge_all
+        rm -f "$(known_hosts_marker_file)"
+        ok "removed $removed boxy line(s) from $(known_hosts_file)"
+        note "no longer managing it; 'boxy ssh' is unaffected and still uses -F"
+        if [ "$removed" != "0" ]; then
+            note "previous contents: $(known_hosts_backup_file)"
+        fi
+        # An `if` rather than `[ … ] && return 0`: this is the last statement in
+        # the branch, so under `set -e` a false test would exit the script
+        # rather than fall through to the --install work.
+        if [ "$install" = "0" ]; then return 0; fi
+    fi
+
     local out
     out="$(write_ssh_config)"
+
+    if [ "$known" = "1" ]; then
+        local khf name n=0
+        khf="$(known_hosts_file)"
+        known_hosts_prune_stale
+        for name in $(list_instances); do
+            inst_label_load "$name"
+            [ "$(inst_label "$name" boxy.role)" = "box" ] || continue
+            known_hosts_install "$name"
+            n=$(( n + 1 ))
+        done
+        mkdir -p "$BOXY_STATE_DIR"; : > "$(known_hosts_marker_file)"
+        ok "added host keys for $n box(es) to $khf"
+        note "each line is tagged 'boxy:NAME'; create and rm now keep it current"
+        note "previous contents: $(known_hosts_backup_file)"
+    fi
+
     if [ "$install" = "0" ]; then
+        [ "$known" = "1" ] && return 0
         cat "$out"
         note ""
         note "wrote $out — use it with: ssh -F $out <name>"
@@ -1416,6 +1713,7 @@ cmd_ssh_config() {
     touch "$usercfg"; chmod 600 "$usercfg"
     if grep -qF "$line" "$usercfg"; then
         ok "~/.ssh/config already includes boxy hosts"
+        [ "$known" = "1" ] || ssh_config_known_hosts_hint
         return 0
     fi
     cp "$usercfg" "$usercfg.boxy-backup.$(date +%s)"
@@ -1425,6 +1723,7 @@ cmd_ssh_config() {
     mv "$usercfg.tmp" "$usercfg"
     chmod 600 "$usercfg"
     ok "added '$line' to the top of ~/.ssh/config (backup alongside it)"
+    [ "$known" = "1" ] || ssh_config_known_hosts_hint
 }
 
 # ===========================================================================
@@ -2140,6 +2439,13 @@ cmd_rm() {
         docker rm -f "boxy-sidecar-$name" >/dev/null 2>&1 || true
         [ "$net" != "full" ] && remove_network_if_unused "boxy-iso-$name"
         remove_network_if_unused "boxy-egress"
+
+        # Take back only what boxy put in the shared known_hosts, matched by
+        # the `boxy:NAME` marker on each line it wrote. A no-op unless
+        # `ssh-config --known-hosts` was ever run. Ordered before the state dir
+        # goes, though the marker is what makes that ordering not matter: a box
+        # removed with `docker rm` behind boxy's back still cleans up here.
+        known_hosts_purge "$name"
 
         case "$sdir" in
             "$BOXY_STATE_DIR"/instances/*) rm -rf "$sdir" ;;
