@@ -224,7 +224,31 @@ assert_contains "logs: a leading -f is docker's flag, not a box name" "boxy" \
     "$(boxy logs --tail 5 2>&1)"
 assert_contains "logs: and an unknown name is still an error" "no such instance" \
     "$(boxy logs nosuchbox --tail 5 2>&1)"
+
+# --sidecar reads the other container. It is boxy's own flag, so it has to
+# survive an omitted name and sit on either side of a given one, while
+# everything from the first docker option onwards still goes to docker.
+assert_contains "logs --sidecar: reads the sidecar with the name omitted" "[boxy-sidecar]" \
+    "$(boxy logs --sidecar 2>&1)"
+assert_contains "logs -s: short form, name after the flag" "[boxy-sidecar]" \
+    "$(boxy logs -s onlybox 2>&1)"
+assert_contains "logs -s: name before the flag" "[boxy-sidecar]" \
+    "$(boxy logs onlybox -s 2>&1)"
+# --since is docker's and shares its opening letters with the short form. Were
+# the match a prefix rather than exact, boxy would swallow --since and hand
+# docker "0m" as the container name, which fails loudly — so an empty result
+# is the proof that docker received the flag intact.
+assert_empty "logs: --since is docker's, not a mangled --sidecar" \
+    "$(boxy logs -s onlybox --since 0m 2>&1)"
 boxy rm onlybox >/dev/null 2>&1
+
+section "logs --sidecar on a box that has no sidecar"
+# A --net full box is alone in its container. Left to docker this surfaced as
+# "No such container: boxy-sidecar-<name>", which reads like a boxy bug.
+boxy create -n fullbox >/dev/null 2>&1
+assert_contains "says why rather than letting docker say no such container" "has no sidecar" \
+    "$(boxy logs --sidecar fullbox 2>&1)"
+boxy rm fullbox >/dev/null 2>&1
 
 section "messages when the name cannot be inferred"
 assert_contains "no boxes at all" "no boxes exist" "$(boxy info 2>&1)"

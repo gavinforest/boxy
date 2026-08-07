@@ -107,7 +107,7 @@ container name is the box name.
 | Command                     | Wraps               | Why bother                                                                                                      |
 | --------------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `boxy exec [NAME] [-- CMD]` | `docker exec`       | Sets the box user, `$HOME` and `/work`; works when SSH is broken. Needs a terminal only for the no-command form |
-| `boxy logs [NAME] [-f]`     | `docker logs`       | The entrypoint's setup narration — the first place to look when a box misbehaves                                |
+| `boxy logs [NAME] [-f]`     | `docker logs`       | The entrypoint's setup narration — the first place to look when a box misbehaves. `--sidecar` reads the sidecar's instead; control characters are stripped unless `--raw` |
 | `boxy start\|stop\|restart` | `docker start/stop` | Moves the sidecar with the box, and waits for SSH to answer before returning                                     |
 | `boxy top [--watch]`        | `docker stats`      | Filters to boxy-managed containers                                                                              |
 
@@ -116,6 +116,20 @@ count toward that — a single `--net limited` box still lets you omit it. That
 holds for the passthroughs too: a leading `-f` or `--tail` is read as docker's
 flag rather than as a box name, and `boxy exec -- CMD` separates a command
 from a name you left out, exactly as `boxy ssh -- CMD` does.
+
+`boxy logs` is a passthrough with one deliberate exception: control characters
+are stripped from its output. A container chooses what goes into its own log —
+tinyproxy echoes the requested domain into a denial line, sshd echoes the
+username of a failed login — so raw `ESC` bytes in that text would let a box
+drive your cursor and paint over lines already on screen. It cannot forge a log
+*line* (a bare CR truncates, and `%0d%0a` is never decoded), so what's stored is
+honest either way; this is only about what a terminal is asked to render.
+
+The filtering is not conditional on writing to a terminal, because
+`boxy logs -s web | grep refused` renders at the *end* of the pipeline and boxy
+can't see that far. `ESC` alone is removed, so an injected `[2A` stays in the
+output as visible text rather than disappearing. Use `boxy logs --raw` (or
+`docker logs` directly) when you want the container's exact bytes.
 
 ### `boxy create`
 
@@ -503,14 +517,38 @@ a CONNECT tunnel.
 
 ```bash
 boxy create worktree --net limited --allow example.com
-docker logs boxy-sidecar-boxy-1     # every denial is logged here
+boxy logs --sidecar boxy-1          # every denial is logged here
 #   NOTICE  Proxying refused on filtered domain "example.com"
 ```
 
-There is no boxy wrapper for that yet — `boxy logs` resolves box names only, so
-`boxy logs boxy-sidecar-web` fails with "no such instance". Use `docker logs
-boxy-sidecar-<name>` directly; the container name is always
-`boxy-sidecar-` plus the box name.
+`--sidecar` (`-s`) is the thing to reach for whenever a request fails and the
+box itself has nothing to say about it: the box only sees a CONNECT that did
+not work, and the reason lives on the other container. It takes docker's own
+options too, so `boxy logs -s boxy-1 -f` follows the denials live. The
+underlying container is always `boxy-sidecar-` plus the box name, if you would
+rather talk to docker directly.
+
+That log is deliberately exception-only on the ingress side. The full
+per-connection record — who connected, when, whether the box answered — is
+kept separately and read with `--verbose` (`-v`):
+
+```bash
+boxy logs -v boxy-1               # every connection through the relay
+boxy logs -v boxy-1 -f            # follow it live
+#   socat[110] N accepting connection from AF=2 172.19.0.1:44802
+#   socat[110] N opening connection to AF=2 172.19.0.3:22
+```
+
+The split exists because socat at `-dd` spends about a dozen lines on one
+connection, which would bury everything else. Error-level lines are echoed
+back into the container log so `boxy logs -s` still shows real faults on its
+own; warnings are not, because "connection reset by peer" fires on every
+ordinary close and would let anyone reaching a published port flood it.
+
+The trail lives inside the sidecar and is read with `docker cp`, so it is
+still available after that sidecar has stopped — which is when a dead relay
+most needs explaining. It goes away with the container on `boxy rm`, like any
+docker log.
 
 The shipped allowlist covers PyPI, conda-forge, GitHub, npm, Debian, Hugging
 Face and the Anthropic API.
@@ -1024,8 +1062,8 @@ to the running container and did need that check.
 narrates every step. Then `boxy exec <name>`, which uses `docker exec` and
 does not depend on SSH at all.
 
-**A `--net limited` box can't reach something it should.** `docker logs
-boxy-sidecar-<name>` names every refused domain. `boxy allow <name> <domain>`
+**A `--net limited` box can't reach something it should.** `boxy logs
+--sidecar <name>` names every refused domain. `boxy allow <name> <domain>`
 grants it to that box straight away, without dropping the session you are sitting
 in. For a domain every box should have, add it to `~/.config/boxy/allowlist.txt`
 instead — that applies to boxes created afterwards — or pass `--allow` on the next
@@ -1033,8 +1071,9 @@ instead — that applies to boxes created afterwards — or pass `--allow` on th
 403.
 
 **An isolated box is unreachable over SSH.** Its ports live on the sidecar,
-so check that one first: `docker logs boxy-sidecar-<name>` should report the
-listeners it placed. If it exited, the box itself is fine and still reachable
+so check that one first: `boxy logs --sidecar <name>` should report the
+listeners it placed, and `boxy logs -v <name>` shows whether your connection
+reached it at all. If it exited, the box itself is fine and still reachable
 with `boxy exec <name>`.
 
 **Permission errors on a mounted volume (Linux hosts).** boxy passes your

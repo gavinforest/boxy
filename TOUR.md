@@ -581,7 +581,7 @@ making it the single path out. It refuses any domain not in
 ```
 
 ```
-$ docker logs boxy-sidecar-ltd
+$ boxy logs --sidecar ltd
 NOTICE  Proxying refused on filtered domain "example.com"
 ```
 
@@ -693,6 +693,9 @@ you, so it was removed with the rest of the remote-host machinery. `boxy top
 ```bash
 boxy stop|start|restart <name>
 boxy logs <name> -f          # the entrypoint narrates every step here
+boxy logs --sidecar <name>   # the other half: denials and ingress listeners
+boxy logs -v <name>          # every connection through the ingress relay
+boxy logs --raw <name>       # without the control-character stripping
 boxy rm <name>
 ```
 
@@ -701,6 +704,17 @@ narration — host-key generation, authorized-keys install, password set,
 and isolation confirmed. It is the first place to look when a box misbehaves.
 Setup steps that can fail leave the box *running* rather than dead, so you can
 still get in and read why.
+
+An isolated box's story is split across two containers, because the parts that
+can fail on the way in and on the way out both live on the sidecar. `--sidecar`
+(`-s`) reads that one: the ingress listeners it placed, the allowlist it
+compiled, and every domain it later refused. When a box says a request timed
+out and its own log has nothing to add, this is where the reason is.
+
+That log answers "did something break". `-v` answers "what happened" — the
+per-connection audit trail for the ingress relay, kept in a file inside the
+sidecar so a dozen lines per connection never bury the faults. It is still
+readable after the sidecar has stopped, which is the case it exists for.
 
 ### Where your files live
 

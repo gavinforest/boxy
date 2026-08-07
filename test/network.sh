@@ -83,7 +83,105 @@ assert_eq "non-allowlisted https tunnel dropped" "000" \
     "$(bssh ltd 'curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://example.com/')"
 assert_eq "bypassing the proxy does not help" "000" \
     "$(bssh ltd 'curl -s --noproxy "*" -o /dev/null -w "%{http_code}" --max-time 10 https://pypi.org/simple/')"
-assert_contains "denials are logged" "example.com" "$(docker logs boxy-sidecar-ltd 2>&1 | tail -20)"
+assert_contains "denials are logged" "example.com" "$(boxy logs --sidecar ltd 2>&1 | tail -20)"
+
+section "a box cannot paint over the log it is read from"
+# tinyproxy echoes the requested domain into its denial line verbatim, so the
+# box chooses bytes that land in front of whoever reads the log. It cannot
+# forge a LINE — a bare CR truncates the host and %0d%0a is never decoded —
+# but raw ESC would let it drive the reader's cursor and overwrite what is
+# already on screen. The bytes stay in the container log; boxy's job is not to
+# hand them to a terminal to act on.
+cat > "$TEST_TMP/esc.py" <<'PY'
+import socket
+s = socket.create_connection(("boxy-sidecar-ltd", 8888), timeout=6)
+s.sendall(b"GET http://x\x1b[2A\x1b[2KOVERWRITTEN/ HTTP/1.0\r\nHost: x\r\n\r\n")
+s.settimeout(3)
+try:
+    s.recv(200)
+except Exception:
+    pass
+s.close()
+PY
+docker cp "$TEST_TMP/esc.py" ltd:/tmp/esc.py >/dev/null 2>&1
+docker exec ltd /opt/conda/bin/python3 /tmp/esc.py >/dev/null 2>&1
+assert_contains "the escape really reaches the container log" "OVERWRITTEN" \
+    "$(docker logs boxy-sidecar-ltd 2>&1)"
+# A pipe has to be filtered too: it is the LAST stage of a pipeline that
+# renders, and `boxy logs | grep` would otherwise carry the bytes to the
+# terminal through a tool with no reason to filter them.
+assert_empty "a pipe gets no escapes either" \
+    "$(boxy logs --sidecar ltd 2>/dev/null | tr -dc '\033')"
+assert_contains "with the sequence left visible rather than swallowed" "[2A[2KOVERWRITTEN" \
+    "$(boxy logs --sidecar ltd 2>/dev/null)"
+# Both streams are filtered, and independently, so redirecting one still
+# leaves the other meaning what it meant.
+assert_empty "and so does stderr" \
+    "$(boxy logs --sidecar ltd 2>&1 >/dev/null | tr -dc '\033')"
+# --raw is the documented way back to the container's exact bytes.
+assert_contains "--raw hands the bytes over untouched" "$(printf 'x\033[2A')" \
+    "$(boxy logs --raw --sidecar ltd 2>/dev/null)"
+# The terminal case needs a real pty, which only python can hand us here.
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+import pty, sys, os
+sys.exit(pty.spawn(['$BOXY', 'logs', '--sidecar', 'ltd']))" > "$TEST_TMP/pty.out" 2>&1
+    assert_eq "a terminal gets none" "0" \
+        "$(python3 -c "print(open('$TEST_TMP/pty.out','rb').read().count(b'\033'))")"
+else
+    printf '  %sSKIP%s no python3 on the host: cannot allocate a pty\n' "$D" "$O"
+fi
+
+section "the sidecar's ingress audit trail"
+# socat at -dd narrates every accept, fork and close — about a dozen lines per
+# connection, which would bury the startup narration and the faults if it went
+# into the container log. So the trail goes to a file inside the sidecar and
+# only error-level lines are echoed back: the container log keeps meaning
+# "something is wrong", the file holds "what happened".
+boxy create -n aud --net limited >/dev/null 2>&1
+bssh aud true >/dev/null 2>&1
+assert_contains "connections are recorded" "accepting connection" \
+    "$(boxy logs -v aud 2>&1)"
+assert_eq "and stay out of the container log" "0" \
+    "$(boxy logs --sidecar aud 2>&1 | grep -cE 'socat\[[0-9]+\] N ')"
+
+# A relay whose box has stopped is the fault worth surfacing: docker drops the
+# name from its resolver, so socat cannot even reach a connect. /dev/tcp
+# rather than nc, which is not on every host.
+aud_port="$(docker inspect -f '{{index .Config.Labels "boxy.ssh_port"}}' aud)"
+docker stop aud >/dev/null
+(exec 3<>"/dev/tcp/127.0.0.1/$aud_port") >/dev/null 2>&1 || true
+sleep 1
+assert_contains "an error still reaches the container log" "getaddrinfo" \
+    "$(boxy logs --sidecar aud 2>&1)"
+# W is dominated by "connection reset by peer", which fires on every ordinary
+# close — passing it would let anyone reaching a published port flood the log.
+assert_eq "but warnings never do" "0" \
+    "$(boxy logs --sidecar aud 2>&1 | grep -cE 'socat\[[0-9]+\] W ')"
+
+# tinyproxy is the one process in the sidecar an attacker could land in — it
+# parses what the box sends — and it runs as its own user, not root. The trail
+# is written by root and read from outside the container entirely, so nothing
+# in here should be able to touch it, tinyproxy least of all.
+assert_eq "the trail is root-owned and unreadable to anyone else" "600 root" \
+    "$(docker exec boxy-sidecar-aud stat -c '%a %U' /var/log/boxy/ingress.log)"
+assert_eq "as is the directory holding it" "700 root" \
+    "$(docker exec boxy-sidecar-aud stat -c '%a %U' /var/log/boxy)"
+for op in 'head -c 1 /var/log/boxy/ingress.log' 'echo x >> /var/log/boxy/ingress.log' \
+          'rm -f /var/log/boxy/ingress.log'; do
+    if docker exec boxy-sidecar-aud su -s /bin/sh tinyproxy -c "$op" >/dev/null 2>&1; then
+        _fail "tinyproxy cannot: $op" "it succeeded"
+    else
+        _pass "tinyproxy cannot: $op"
+    fi
+done
+
+# docker cp reads a stopped container where docker exec cannot, and a sidecar
+# that has fallen over is exactly when the trail is worth having.
+docker stop boxy-sidecar-aud >/dev/null
+assert_contains "the trail survives a stopped sidecar" "accepting connection" \
+    "$(boxy logs -v aud 2>&1)"
+boxy rm aud >/dev/null 2>&1
 
 section "--allow extends the allowlist"
 boxy create -n ltd2 --net limited --allow example.com >/dev/null 2>&1
@@ -226,6 +324,26 @@ assert_eq "and cannot be made a router" "0" \
 assert_eq "a proxying one grants exactly four" "[CAP_KILL CAP_SETGID CAP_SETPCAP CAP_SETUID]" \
     "$(docker inspect boxy-sidecar-ltd2 --format '{{.HostConfig.CapAdd}}' \
        | tr -d '[]' | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ $//;s/^/[/;s/$/]/')"
+
+# socat terminates every inbound connection, and it needs no privilege to do
+# it: docker sets ip_unprivileged_port_start=0, so any uid binds any port. It
+# was root only by inheritance from a supervisor that has to be root for
+# tinyproxy. Left there, anything landing in it could kill tinyproxy and put an
+# allowlist-free proxy on 8888.
+# Matched on the START of the command line, not anywhere in it: the audit
+# filter's own regex argument contains the text "socat\[", so a loose match
+# reports the uid of grep instead of the relay.
+# The pattern goes in through the environment: a single-quoted `sh -c` script
+# has no positional parameters unless they are passed after it, and an unset
+# one would silently become the empty string and match every process.
+uids() { docker exec -e PAT="$2" "$1" sh -c 'for p in /proc/[0-9]*; do
+    c=$(tr "\0" " " < $p/cmdline 2>/dev/null); u=$(awk "/^Uid:/{print \$2}" $p/status 2>/dev/null)
+    case "$c" in "$PAT"*) printf "%s\n" "$u" ;; esac
+  done' | head -1; }
+assert_eq "the ingress relay runs unprivileged" "65534" "$(uids boxy-sidecar-ltd2 'socat -dd')"
+# tee stays root on purpose: the audit trail must not be writable by the very
+# process whose connections it records.
+assert_eq "but the audit writer stays root" "0" "$(uids boxy-sidecar-ltd2 'tee -a')"
 
 section "published ports work on a sealed box"
 # Docker refuses to bind a host port for an internal-only container, so this

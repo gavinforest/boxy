@@ -429,6 +429,11 @@ port_free() {
 
 state_dir_for() { printf '%s\n' "$BOXY_STATE_DIR/instances/$1"; }
 
+# The sidecar's container name is derived from the box's, never stored: the
+# sidecar carries a boxy.instance label pointing back, but the forward
+# direction is pure naming and a lookup would only be a slower way to spell it.
+sidecar_for() { printf '%s\n' "boxy-sidecar-$1"; }
+
 # One box's egress policy, and the only thing bind-mounted into its sidecar.
 # It gets its own subdirectory because the state directory around it holds the
 # box's sudo password and ssh host keys, and the sidecar has no business
@@ -1211,7 +1216,7 @@ create_prepare_network() {
     NB_NET_NAME="boxy-iso-$NB_NAME"
     ensure_network "$NB_NET_NAME" 1          # internal: Docker enforces egress
     ensure_network "boxy-egress"             # the sidecar's outward network
-    NB_SIDECAR_NAME="boxy-sidecar-$NB_NAME"
+    NB_SIDECAR_NAME="$(sidecar_for "$NB_NAME")"
 
     # Ingress map, one "listenport:box:targetport" per line. The listen port
     # equals the host port so the two never have to be reasoned about apart.
@@ -1376,8 +1381,17 @@ create_launch() {
     # reading — so this warns and returns rather than rolling the box back.
     if ! wait_for_ready "$NB_NAME"; then
         warn "the box did not become SSH-reachable within the timeout. Recent logs:"
-        docker logs --tail 30 "$NB_NAME" >&2 || true
+        # Same terminal-escape hazard as cmd_logs, and this one prints without
+        # anyone having asked for a log, so it is sanitized unconditionally.
+        docker logs --tail 30 "$NB_NAME" 2>&1 | strip_ctl >&2 || true
         warn "'boxy exec $NB_NAME' works without SSH and is the quickest way in."
+        # On an isolated box nothing reaches port 22 directly: ssh arrives via
+        # the sidecar's socat relay, so a timeout is as likely to be a listener
+        # that never came up as anything wrong inside the box — and that half
+        # of the story is only told on the other container.
+        if [ -n "$NB_SIDECAR_NAME" ]; then
+            warn "ssh arrives through the sidecar here; 'boxy logs --sidecar $NB_NAME' shows whether the relay came up."
+        fi
     fi
     return 0
 }
@@ -2132,8 +2146,12 @@ cmd_info() {
         printf 'published   (none)\n'
     fi
     printf 'forwardable %s   %s(boxy forward %s)%s\n' "$BOXY_PORTS" "$C_DIM" "$name" "$C_OFF"
-    if [ "$(inst_label "$name" boxy.net)" = "limited" ]; then
-        printf 'sidecar     boxy-sidecar-%s (docker logs boxy-sidecar-%s for denials)\n' "$name" "$name"
+    # Every non-full box has a sidecar, so report it for `none` too — that one
+    # carries no proxy, but it does own the ingress listeners, which makes its
+    # log the place a port that never answers is explained.
+    if [ "$(inst_label "$name" boxy.net)" != "full" ]; then
+        printf 'sidecar     %s   %s(boxy logs --sidecar %s)%s\n' \
+            "$(sidecar_for "$name")" "$C_DIM" "$name" "$C_OFF"
         local af n
         af="$(box_allowlist_file "$name")"
         if [ -f "$af" ]; then
@@ -2395,7 +2413,7 @@ cmd_allow() {
         return 0
     fi
 
-    local sc="boxy-sidecar-$name"
+    local sc; sc="$(sidecar_for "$name")"
     instance_exists "$sc" || die "allow: sidecar $sc is gone; recreate the box"
     docker inspect -f '{{.State.Running}}' "$sc" 2>/dev/null | grep -q true \
         || die "allow: sidecar $sc is not running — start the box first"
@@ -2606,14 +2624,14 @@ cmd_stop() {
     require_docker
     local name; name="$(resolve_instance "${1:-}")"
     docker stop "$name" >/dev/null
-    docker stop "boxy-sidecar-$name" >/dev/null 2>&1 || true
+    docker stop "$(sidecar_for "$name")" >/dev/null 2>&1 || true
     ok "stopped $name"
 }
 
 cmd_start() {
     require_docker
     local name; name="$(resolve_instance "${1:-}")"
-    docker start "boxy-sidecar-$name" >/dev/null 2>&1 || true
+    docker start "$(sidecar_for "$name")" >/dev/null 2>&1 || true
     docker start "$name" >/dev/null
     # Nothing to reapply: isolation belongs to the network, not to the running
     # container, so it is already in force before this returns.
@@ -2623,19 +2641,140 @@ cmd_start() {
 
 cmd_restart() { cmd_stop "$@"; cmd_start "$@"; }
 
+# Drop the C0 control characters, keeping tab and newline.
+#
+# Only ESC itself goes, not the sequence behind it, so an injected `[2A` shows
+# up as visible text rather than vanishing — the log should read oddly, not
+# read clean. C1 (0x80-0x9F) is deliberately untouched: stripping it would
+# corrupt legitimate UTF-8, and a terminal in UTF-8 mode does not honour
+# 8-bit CSI anyway.
+strip_ctl() { tr -d '\000-\010\013-\037\177'; }
+
+# `docker logs` is a byte-exact pipe and the container decides what goes into
+# it, which makes the log a channel the box can write to your terminal.
+# tinyproxy echoes the requested domain into its denial line verbatim, so a
+# box that asks for a host containing ESC[2A ESC[2K puts a cursor-up and an
+# erase-line on your screen: what is *stored* stays honest — CR truncates and
+# %0d%0a is never decoded, so no line can be forged — but what you SEE can
+# have its earlier lines painted over. sshd's "invalid user <name>" carries
+# the same hazard for whoever can reach a published port.
+#
+# Stripping only when stdout is a terminal is the obvious idea and it does not
+# work: `boxy logs -s web | grep refused` puts grep between boxy and the
+# screen, so boxy sees a pipe, hands over the bytes, and grep — which has no
+# reason to filter anything — passes them to the terminal unchanged. It is the
+# LAST stage of a pipeline that renders, and boxy cannot see that far. Since
+# piping is how logs are normally read, the filter has to hold regardless of
+# what is downstream.
+#
+# --raw is the way back to the bytes as the container wrote them, for piping
+# into something that wants them intact. `docker logs` direct is the other,
+# and the container log itself is untouched either way.
+#
+# Both streams are filtered while staying apart, which is what the fd shuffle
+# buys: docker's stderr goes down the inner pipe to one strip_ctl, its stdout
+# is handed to fd 3 — the outer pipe — and reaches the other. That keeps
+# `boxy logs -s NAME 2>/dev/null` meaning "denials only". A process
+# substitution would read more simply and lose trailing lines under `-f`,
+# because bash does not wait for one to flush.
+docker_logs_sanitized() {
+    { docker logs "$@" 2>&1 1>&3 | strip_ctl >&2; } 3>&1 | strip_ctl
+}
+
+# Where the sidecar keeps the ingress audit trail. Must match the entrypoint.
+BOXY_AUDIT_PATH=/var/log/boxy/ingress.log
+
+# The per-connection record, which lives in a file inside the sidecar rather
+# than in its container log — see the entrypoint for why.
+#
+# `docker cp` rather than `docker exec cat`, because cp reads a stopped
+# container and exec does not: a sidecar that has fallen over is exactly when
+# the trail is worth having. cp emits a tar stream even for a single file,
+# hence the extraction.
+logs_audit() {
+    local sc="$1"; shift
+    local a follow=0
+    for a in "$@"; do
+        case "$a" in -f|--follow) follow=1 ;; esac
+    done
+
+    if [ "$follow" = 1 ]; then
+        docker inspect -f '{{.State.Running}}' "$sc" 2>/dev/null | grep -q true \
+            || die "logs: cannot follow the audit trail of a stopped sidecar; drop -f to read what it recorded."
+        docker exec "$sc" tail -n +1 -f "$BOXY_AUDIT_PATH" | strip_ctl
+        return
+    fi
+
+    # `|| rc=$?` rather than a bare pipeline: pipefail plus set -e would
+    # otherwise take the script out before the failure could be explained.
+    local rc=0
+    docker cp "$sc:$BOXY_AUDIT_PATH" - 2>/dev/null | tar -xO 2>/dev/null | strip_ctl || rc=$?
+    # No file at all reads exactly like a file with nothing in it, so the two
+    # have to be told apart here rather than left looking the same.
+    if [ "$rc" != 0 ]; then
+        die "logs: no ingress audit trail in $sc at $BOXY_AUDIT_PATH — a sidecar created before this existed will not have one; recreate the box to get it."
+    fi
+}
+
 cmd_logs() {
     require_docker
     # A leading option is docker's, not a box name. Without this check the
     # documented `boxy logs -f` — the name omitted, as it may be whenever one
     # box exists — resolved "-f" as an instance and died with "no such
     # instance: -f".
-    local name=""
-    case "${1:-}" in
-        -*) ;;
-        *)  name="${1:-}"; shift || true ;;
-    esac
+    #
+    # --sidecar and --raw are boxy's own rather than docker's, and may sit on
+    # either side of the name: `boxy logs -s mybox` and `boxy logs mybox -s`
+    # are both natural to type. Everything from the first docker option onwards
+    # is docker's verbatim, exactly as before — which is also why the match
+    # here is exact, so `-s` cannot swallow docker's own `--since`.
+    local name="" sidecar=0 raw=0 verbose=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -s|--sidecar) sidecar=1; shift ;;
+            --raw)        raw=1; shift ;;
+            # The audit trail is a property of the sidecar, so asking for it
+            # says which container you meant.
+            -v|--verbose) verbose=1; sidecar=1; shift ;;
+            -*)           break ;;
+            *)            if [ -n "$name" ]; then break; fi
+                          name="$1"; shift ;;
+        esac
+    done
     name="$(resolve_instance "$name")"
-    exec docker logs "$@" "$name"
+
+    local target="$name"
+    if [ "$sidecar" = 1 ]; then
+        # A `full` box is alone in its container: no sidecar was ever created
+        # for it, so this would otherwise surface as docker's "No such
+        # container", which reads like a boxy bug rather than a wrong question.
+        local net; net="$(inst_label "$name" boxy.net)"
+        if [ "$net" = "full" ]; then
+            die "logs: $name runs with --net full and has no sidecar — 'boxy logs $name' is all there is."
+        fi
+
+        # `--net none` gets an ingress-only sidecar: the entrypoint starts the
+        # socat listeners and stops there, never reaching tinyproxy. The log is
+        # real and worth reading for a port that will not answer, but anyone
+        # here hunting a blocked domain is looking at a box that blocks all.
+        if [ "$net" = "none" ]; then
+            warn "$name runs with --net none: this sidecar carries ingress only, so it logs listeners, not denials."
+        fi
+        target="$(sidecar_for "$name")"
+    fi
+
+    # The audit trail is a file, not a container log, so docker's log options
+    # have nothing to act on here — -f is the one that still means something.
+    if [ "$verbose" = 1 ]; then
+        logs_audit "$target" "$@"
+        return
+    fi
+
+    # --raw is the only path that still hands docker's output straight on.
+    if [ "$raw" = 1 ]; then
+        exec docker logs "$@" "$target"
+    fi
+    docker_logs_sanitized "$@" "$target"
 }
 
 # Remove a box. One behaviour, no flags, no confirmation — because nothing it
@@ -2696,7 +2835,7 @@ cmd_rm() {
         wt_branch="$(inst_label "$name" boxy.worktree_branch)"
 
         docker rm -f "$name" >/dev/null 2>&1 || true
-        docker rm -f "boxy-sidecar-$name" >/dev/null 2>&1 || true
+        docker rm -f "$(sidecar_for "$name")" >/dev/null 2>&1 || true
         [ "$net" != "full" ] && remove_network_if_unused "boxy-iso-$name"
         remove_network_if_unused "boxy-egress"
 
@@ -2955,6 +3094,9 @@ CORE
 DOCKER PASSTHROUGH — resolve the box name, then hand off to docker
   exec [NAME] [CMD]          adds defaults: as box user, at /work
   logs [NAME] [-f]           the box's entrypoint narration
+    --sidecar, -s            the sidecar's instead: egress denials, listeners
+    --verbose, -v            the sidecar's per-connection ingress audit trail
+    --raw                    skip control-character stripping
   start|stop|restart [NAME]  lifecycle + ensures sidecar follows box
   top [--watch]              [docker stats] for boxes and sidecars
 

@@ -19,6 +19,28 @@ GENERATION=/run/boxy-proxy-generation
 
 PORT="${BOXY_PROXY_PORT:-8888}"
 
+# Every ingress connection, recorded: who connected, when, and whether the box
+# answered. `boxy logs --verbose --sidecar` reads it.
+#
+# It is a file rather than more of the container log because socat at -dd
+# spends about a dozen lines on a single connection, which would bury the
+# startup narration and the errors under traffic. The container log stays
+# exception-only; the detail lives here.
+AUDIT=/var/log/boxy/ingress.log
+
+# socat tags every message with a severity letter after the pid: F fatal,
+# E error, W warn, N notice. -dd is what makes it emit N, and N is where the
+# per-connection accepts live.
+#
+# Only F and E are echoed back to the container log. W is dominated by
+# "connection reset by peer", which fires on every ordinary close — so passing
+# W would hand anyone who can reach a published port an unlimited supply of
+# lines to push into the log that is supposed to show real faults.
+#
+# Anchored on socat's own prefix rather than a bare " E ", so a message whose
+# body happens to contain that text cannot promote itself.
+AUDIT_PASS='^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} socat\[[0-9]+\] [FE] '
+
 log() { printf '[boxy-sidecar] %s\n' "$*" >&2; }
 
 # ---------------------------------------------------------------------------
@@ -59,12 +81,69 @@ start_ingress() {
         sleep 0.1
     done
 
+    # Root writes the trail and `docker cp` reads it from outside the
+    # container's user model entirely, so nothing in here needs access to it —
+    # least of all tinyproxy, which is the one process an attacker could land
+    # in (it parses what the box sends) and which has nothing to do with
+    # ingress. Left at the default 644 it could read every inbound peer
+    # address; 600 inside a 700 directory closes both the file and the path to
+    # it. Reapplied on every start, so a sidecar that came up under a looser
+    # default is corrected rather than left as it was.
+    #
+    # touch rather than `install -m`, because the trail has to survive a
+    # container restart and install would truncate it.
+    mkdir -p "$(dirname "$AUDIT")"
+    chmod 700 "$(dirname "$AUDIT")"
+    touch "$AUDIT"
+    chmod 600 "$AUDIT"
+
+    # socat writes every diagnostic to stderr and has exactly one sink, so the
+    # split between "keep it all" and "surface the faults" has to happen out
+    # here. 2>&1 is safe to merge: a TCP-LISTEN/TCP socat never writes to
+    # stdout, so stderr is all there is.
+    #
+    # A plain background pipeline rather than a process substitution, so the
+    # three processes form one job. shutdown() kills the job leader — socat —
+    # and the EOF cascades through tee to grep, which is why nothing extra
+    # needs reaping.
+    # socat needs no privilege of its own. Docker sets
+    # net.ipv4.ip_unprivileged_port_start=0 in every container, so any uid can
+    # bind any port here — even 80 — and the outbound connect to the box needs
+    # nothing either. It runs as root only because it is launched from a
+    # supervisor that has to be root for tinyproxy's sake.
+    #
+    # That matters because socat is the process on the receiving end of every
+    # inbound connection, and root in a proxying sidecar is not the toothless
+    # root of the ingress-only one: SETUID, SETGID and KILL are all present, so
+    # anything landing there could kill tinyproxy and put its own proxy on 8888
+    # with no allowlist at all. Dropping to nobody costs one word and takes
+    # that away.
+    #
+    # setpriv rather than runuser because it execs instead of forking: the job
+    # leader stays socat itself, so shutdown()'s kill still reaches it and the
+    # EOF still cascades to tee and grep — which stay root, so a compromised
+    # relay cannot rewrite the trail that recorded it.
+    #
+    # An ingress-only sidecar runs under --cap-drop=ALL with nothing added, so
+    # it cannot change uid at all. It does not need to: without CAP_SETUID,
+    # CAP_KILL or CAP_DAC_OVERRIDE its root cannot become another user, signal
+    # one, or step past a file mode. Probing for the capability says exactly
+    # that, and says it in one line.
+    local drop=()
+    if setpriv --reuid=65534 --regid=65534 --clear-groups true 2>/dev/null; then
+        drop=(setpriv --reuid=65534 --regid=65534 --clear-groups)
+        log "ingress relays drop to uid 65534"
+    fi
+
     local line lp th tp
     while IFS= read -r line; do
         [[ -z "${line// }" ]] && continue
         lp="${line%%:*}"; th="$(printf '%s' "$line" | cut -d: -f2)"; tp="${line##*:}"
         log "  :$lp -> $th:$tp"
-        socat "TCP-LISTEN:$lp,fork,reuseaddr,bind=$out_ip" "TCP:$th:$tp" &
+        ${drop[@]+"${drop[@]}"} \
+            socat -dd "TCP-LISTEN:$lp,fork,reuseaddr,bind=$out_ip" "TCP:$th:$tp" 2>&1 \
+            | tee -a "$AUDIT" \
+            | grep --line-buffered -E "$AUDIT_PASS" >&2 &
     done <<< "$BOXY_RELAY"
 }
 
