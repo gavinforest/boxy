@@ -22,13 +22,24 @@ ARG TARGETARCH
 ARG USERNAME=boxyboy
 ARG USER_UID=1000
 ARG USER_GID=1000
-# Both default OFF. The base image is the stack you actually asked for;
-# everything optional is a deliberate opt-in via `boxy build --full`.
-#   INSTALL_EXTRAS      jupyterlab, polars, pyarrow, scikit-learn   (+462 MB)
-#   INSTALL_CLAUDE_CODE @anthropic-ai/claude-code                   (+291 MB)
-ARG INSTALL_CLAUDE_CODE=0
-ARG INSTALL_EXTRAS=0
-ARG PYTHON_VERSION=3.12
+# INSTALL_EXTRAS, INSTALL_CLAUDE_CODE and PYTHON_VERSION are deliberately NOT
+# declared here. Each is declared immediately above the one RUN that reads it.
+#
+# An ARG is in scope from its declaration to the end of the stage, and a RUN's
+# cache key includes the value of every in-scope arg — whether or not that RUN
+# mentions it. Declared up here, `boxy build --claude` gave the apt layer below
+# a key no previous build had, so it re-downloaded the whole of Debian, then
+# would have re-run mamba and pip, before reaching the single npm line that
+# actually differs. Measured at 45 minutes still on step 2 of 17.
+#
+# Not a quirk of the pinned frontend: docker/dockerfile:1 behaves identically.
+# Moving the declaration down is the fix, and it is what keeps all four variants
+# sharing every layer up to the point where they genuinely diverge.
+#
+# ARG USERNAME above is the one remaining case — the ENV below expands it into
+# BOXY_USER, so it reaches apt's cache key by that route too. Left alone because
+# unpicking it means splitting the ENV block, and USERNAME is not a knob anyone
+# turns per build.
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -160,6 +171,7 @@ ENV PATH=${CONDA_DIR}/bin:${PATH}
 # weight in a headless container reached over SSH. matplotlib-base is the same
 # plotting library without the interactive backends; Agg still works, so
 # savefig() and marimo/notebook rendering are unaffected.
+ARG PYTHON_VERSION=3.12
 RUN set -eux; \
     mamba install -y -n base -c conda-forge \
     "python=${PYTHON_VERSION}" \
@@ -185,19 +197,26 @@ RUN set -eux; \
     ; \
     rm -rf "$HOME/.cache/pip"
 
-# Opt-in extras. Anything here is reachable at runtime with `pip install` or
-# `uv pip install` anyway — the conda prefix is user-writable — so baking them
-# in only pays off if you want them in every box.
+# Opt-in extras: jupyterlab, polars, pyarrow, scikit-learn (+462 MB). Off by
+# default — anything here is reachable at runtime with `pip install` or
+# `uv pip install` anyway, since the conda prefix is user-writable, so baking
+# them in only pays off if you want them in every box.
+#
+# This is the first line of the file whose cache key depends on the variant, and
+# that is the point: everything above is shared by all four. See the note beside
+# the ARGs at the top.
+ARG INSTALL_EXTRAS=0
 RUN set -eux; \
     if [ "${INSTALL_EXTRAS}" = "1" ]; then \
     pip install --no-cache-dir jupyterlab polars pyarrow scikit-learn; \
     rm -rf "$HOME/.cache/pip"; \
     fi
 
-# Optional: Claude Code inside the box, for when you want an agent working
-# locally on the volume rather than reaching in over SSH.
+# Optional: Claude Code inside the box (+291 MB), for when you want an agent
+# working locally on the volume rather than reaching in over SSH.
 # npm's global prefix is conda's own /opt/conda, which this user owns — no
 # sudo and no root-owned files in the tree.
+ARG INSTALL_CLAUDE_CODE=0
 RUN set -eux; \
     if [ "${INSTALL_CLAUDE_CODE}" = "1" ]; then \
     npm install -g @anthropic-ai/claude-code; \

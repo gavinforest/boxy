@@ -883,6 +883,15 @@ and `boxy doctor` lists what you have:
 Each image also carries a `boxy.variant` label, which is what identifies it if
 you retag it or set `BOXY_IMAGE` to a name of your own.
 
+Building a second variant does not rebuild the first. The `INSTALL_*` args are
+declared immediately above the `RUN` that reads them rather than at the top of
+the Dockerfile, because an `ARG` in scope contributes to every later layer's
+cache key whether or not that layer uses it — declared at the top, `--claude`
+gave the `apt` layer a key no build had produced and re-downloaded the whole of
+Debian before reaching the one `npm` line that differs. As written, all four
+variants share every layer up to the point where they genuinely diverge, so the
+second one costs only what it adds.
+
 `BOXY_IMAGE` in your config sets which variant a plain `boxy create` gets, and
 the build names follow it: `BOXY_IMAGE=myimg:v2` makes `boxy build --full`
 produce `myimg-full:v2`. Setting it to `boxy-full:latest` is the ordinary way to
