@@ -983,6 +983,10 @@ CPU-only; for GPU you would add a CUDA build target and `jax[cuda12]`.
 
 ## Security notes
 
+For the full picture — how both containers are built, which process runs as
+what, where every log goes, and what does *not* hold up — see
+[SECURITY.md](SECURITY.md). The highlights:
+
 - SSH is key-only. Passwords exist for `sudo` and are never accepted by sshd.
 - Published ports bind to loopback by default.
 - **In general, the kernel is shared**, so a kernel privilege-escalation bug escapes
