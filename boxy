@@ -1577,6 +1577,135 @@ cmd_ls() {
     done
 }
 
+# "2 boxes, 1 running" for one image name and one container role, or "none".
+#
+# Never a bare number: a "2" in a column beside box names reads as boxy-2, so
+# the noun does the disambiguating. Takes the container table rather than
+# reaching for the caller's copy of it, because bash would let it and that is
+# exactly the kind of coupling that survives until someone moves the function.
+# The plural is spelled out rather than built by appending an "s", which is how
+# this first printed "2 boxs".
+# $6=no drops the running split, for containers whose running state is not yours
+# to set. A sidecar is up exactly when its box is, so the split says nothing you
+# could act on — and it pushed the qualifier that follows out past a clause it
+# was never meant to attach to.
+usage_cell() {
+    local table="$1" img="$2" role="$3" one="$4" many="$5" with_running="${6:-yes}"
+    local counts total running noun
+    counts="$(printf '%s\n' "$table" | awk -F'|' -v n="$img" -v r="$role" \
+        '$1==n && $4==r {t++; if($2=="running") u++} END{printf "%d %d", t+0, u+0}')"
+    total="${counts% *}"; running="${counts#* }"
+    # An empty noun leaves the bare count, for a row whose first column has
+    # already named the thing being counted.
+    case "$total" in
+        0) printf 'none'; return 0 ;;
+        1) noun="1${one:+ $one}" ;;
+        *) noun="$total${many:+ $many}" ;;
+    esac
+    if [ "$with_running" = yes ]; then
+        printf '%s, %s running' "$noun" "$running"
+    else
+        printf '%s' "$noun"
+    fi
+}
+
+# ===========================================================================
+# images
+# ===========================================================================
+# What you can run, and what is running on it. `boxy ls` is the same question
+# asked of boxes; this asks it of images.
+#
+# Every variant is listed whether or not it has been built, because the useful
+# question is "have I built the full one?" and that cannot be answered by a
+# listing that only shows what exists.
+cmd_images() {
+    require_docker
+    local verbose=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -v|--verbose) verbose=1 ;;
+            -h|--help)
+                cat >&2 <<'EOF'
+usage: boxy images [-v]
+
+  Every build variant, whether it is built, and which boxes are on it.
+  -v also names those boxes.
+EOF
+                return 0 ;;
+            *) die "images: unknown option $1" ;;
+        esac
+        shift
+    done
+
+    # Two docker calls for the whole table. `docker images` already formats size
+    # and age, so the numbers here are the ones `docker images` would show you
+    # rather than a second opinion computed from raw bytes.
+    local meta usage
+    meta="$(docker images --format '{{.Repository}}:{{.Tag}}|{{.Size}}|{{.CreatedSince}}' 2>/dev/null || true)"
+    # .Image is the name the container was created from, which is what makes a
+    # row's count mean "boxes on THIS name". Matching on image ID instead would
+    # report none after a rebuild, since the boxes still hold the old ID.
+    # Sidecars come back in the same query, tagged by role, so the block below
+    # can count them without a second call.
+    usage="$(docker ps -a --filter 'label=boxy.managed=1' \
+        --format '{{.Image}}|{{.State}}|{{.Names}}|{{.Label "boxy.role"}}' 2>/dev/null || true)"
+
+    # BUILT is docker's CreatedSince, which runs to "About a minute ago" — 18.
+    local fmt='%-15s %-26s %-8s %-18s %s\n'
+    # shellcheck disable=SC2059
+    printf "$fmt" VARIANT IMAGE SIZE BUILT "IN USE"
+
+    local v img size built use vlabel
+    for v in base extras claude full; do
+        img="$(variant_image "$BOXY_IMAGE" "$v")"
+        size="-"; built="not built"
+        if image_exists "$img"; then
+            size="$(printf '%s\n' "$meta" | awk -F'|' -v n="$img" '$1==n{print $2; exit}')"
+            built="$(printf '%s\n' "$meta" | awk -F'|' -v n="$img" '$1==n{print $3; exit}')"
+        fi
+        use="$(usage_cell "$usage" "$img" box box boxes)"
+        vlabel="$v"
+        [ "$img" = "$BOXY_IMAGE" ] && vlabel="$v (default)"
+        # shellcheck disable=SC2059
+        printf "$fmt" "$vlabel" "$img" "$size" "$built" "$use"
+    done
+
+    # Its own block, because putting it in the table above would make it look
+    # like a fifth thing to pass to --image. It is counted like the rest — the
+    # number is real and worth knowing — with the qualifier saying that the
+    # count is not something you drive: boxy starts and stops these with the
+    # `--net limited` and `--net none` boxes that need them.
+    printf '\n'
+    size="-"; built="not built"
+    if image_exists "$BOXY_PROXY_IMAGE"; then
+        size="$(printf '%s\n' "$meta" | awk -F'|' -v n="$BOXY_PROXY_IMAGE" '$1==n{print $2; exit}')"
+        built="$(printf '%s\n' "$meta" | awk -F'|' -v n="$BOXY_PROXY_IMAGE" '$1==n{print $3; exit}')"
+    fi
+    # shellcheck disable=SC2059
+    printf "$fmt" sidecar "$BOXY_PROXY_IMAGE" "$size" "$built" \
+        "$(usage_cell "$usage" "$BOXY_PROXY_IMAGE" sidecar "" "" no) (boxy managed)"
+
+    # The names behind the counts. Kept out of the table because a box list has
+    # no bounded width, and out of the default output because the count is what
+    # you usually want.
+    [ "$verbose" = 1 ] || return 0
+    local names
+    printf '\n'
+    # The sidecar is included: its containers are named after the box they
+    # belong to, which is the one thing a count of them cannot tell you.
+    for img in \
+        "$(variant_image "$BOXY_IMAGE" base)" \
+        "$(variant_image "$BOXY_IMAGE" extras)" \
+        "$(variant_image "$BOXY_IMAGE" claude)" \
+        "$(variant_image "$BOXY_IMAGE" full)" \
+        "$BOXY_PROXY_IMAGE"; do
+        names="$(printf '%s\n' "$usage" | awk -F'|' -v n="$img" \
+            '$1==n{printf "%s%s (%s)", sep, $3, $2; sep=", "}')"
+        [ -n "$names" ] || continue
+        printf '  %-26s %s\n' "$img" "$names"
+    done
+}
+
 # Reality checks against the labels.
 #
 # A label records what you ASKED FOR at create time. Most of them cannot
@@ -1656,6 +1785,12 @@ cmd_info() {
     printf 'name        %s\n' "$name"
     printf 'status      %s\n' "$(docker inspect -f '{{.State.Status}}' "$name")"
     printf 'created     %s\n' "$(inst_label "$name" boxy.created)"
+    # Which stack this box is actually on. Not a boxy label: the image is
+    # docker's own record of what the container was created from, and taking it
+    # from there cannot drift the way a copy of it could. `boxy images` answers
+    # the same question from the other end, by image rather than by box.
+    printf 'image       %s\n' \
+        "$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null)"
     printf 'user        %s\n' "$(inst_label "$name" boxy.user)"
     printf 'ssh         ssh -F %s %s\n' "$(ssh_config_path)" "$name"
     printf 'ssh port    %s\n' "$(inst_label "$name" boxy.ssh_port)"
@@ -2501,6 +2636,7 @@ CORE
   forward [NAME] [PORTS]     tunnel box ports to the SAME local ports
   rm NAME...                 remove a box (doesn't touch your files)
   ls                         list boxes
+  images [-v]                build variants, which are built, what runs on them
   info [NAME]                one box in detail, config and reality
   password [NAME]            print the stored sudo password for [NAME]
   env [NAME] [K=V ...]       list or set/inject env vars
@@ -2531,6 +2667,7 @@ main() {
         create|new)  cmd_create "$@" ;;
         ls|list|ps)  cmd_ls "$@" ;;
         info)        cmd_info "$@" ;;
+        images)      cmd_images "$@" ;;
         ssh)         cmd_ssh "$@" ;;
         exec|sh)     cmd_exec "$@" ;;
         forward|fwd) cmd_forward "$@" ;;

@@ -285,6 +285,65 @@ assert_eq "the built image records which variant it is" "base" \
 # than confirming a single name that could hold anything.
 assert_contains "doctor marks which image is the default" \
     "image boxy-base:latest   present (default)" "$(boxy doctor)"
+section "boxy images"
+# The count cell, against a synthetic container table. Done this way because the
+# interesting cases are 0, 1 and 2+, and standing up a second and third box to
+# reach them costs a minute each — which is why the plural went unnoticed until
+# it printed "2 boxs" by hand.
+UFN="$TEST_TMP/usage.fn"
+sed -n -e '/^usage_cell()/,/^}/p' "$BOXY" > "$UFN"
+. "$UFN"
+assert_eq "the helper was found" "function" "$(type -t usage_cell)"
+UTBL='boxy-base:latest|running|boxy-1|box
+boxy-base:latest|exited|boxy-3|box
+boxy-claude:latest|running|boxy-2|box
+boxy-internalproxy:latest|running|boxy-sidecar-boxy-1|sidecar'
+assert_eq "two of a thing is spelled out, not suffixed" "2 boxes, 1 running" \
+    "$(usage_cell "$UTBL" boxy-base:latest box box boxes)"
+assert_eq "one is singular" "1 box, 1 running" \
+    "$(usage_cell "$UTBL" boxy-claude:latest box box boxes)"
+assert_eq "nothing is 'none', not a zero" "none" \
+    "$(usage_cell "$UTBL" boxy-full:latest box box boxes)"
+# Boxes and sidecars share the boxy.managed label and can share an image name in
+# a custom config, so the role has to be part of the match, not just the name.
+assert_eq "sidecars are counted in their own units" "1 sidecar, 1 running" \
+    "$(usage_cell "$UTBL" boxy-internalproxy:latest sidecar sidecar sidecars)"
+# A sidecar is up exactly when its box is, so its running count is not something
+# you set. Dropping it also keeps "(boxy managed)" attached to the sidecars
+# rather than trailing a "N running" clause it was never qualifying.
+assert_eq "and can omit a running split that is not yours to set" "1 sidecar" \
+    "$(usage_cell "$UTBL" boxy-internalproxy:latest sidecar sidecar sidecars no)"
+# The sidecar row's first column already says "sidecar", so repeating it in the
+# count is noise that only widens the line.
+assert_eq "an empty noun leaves the bare count" "1" \
+    "$(usage_cell "$UTBL" boxy-internalproxy:latest sidecar "" "" no)"
+assert_eq "and are not counted as boxes" "none" \
+    "$(usage_cell "$UTBL" boxy-internalproxy:latest box box boxes)"
+
+# Every variant is listed whether or not it exists, because "have I built the
+# full one?" is the question, and a listing of what exists cannot answer it.
+IMGS="$(boxy images)"
+for v in base extras claude full; do
+    assert_contains "$v is listed" "$v" "$IMGS"
+done
+assert_contains "an unbuilt variant says so rather than being absent" "not built" "$IMGS"
+assert_contains "the default is marked on the variant" "base (default)" "$IMGS"
+# The sidecar is counted like the rest — the number is real — but qualified, so
+# it does not read as a fifth stack you drive. It sits below the table, not in it.
+assert_contains "the sidecar count says who drives it" "(boxy managed)" "$IMGS"
+assert_contains "and the sidecar row still names itself" "sidecar" "$IMGS"
+# boxy-1 exists and is running, from the default image. The count must read as a
+# quantity: a bare "1" in this column would look like the box named boxy-1.
+assert_contains "a used image counts its boxes, with the noun" "1 box, 1 running" "$IMGS"
+assert_contains "an unused one says none, not 0" "none" "$IMGS"
+# -v answers "which ones", which the count deliberately does not.
+assert_contains "-v names the boxes behind the count" "boxy-1 (running)" \
+    "$(boxy images -v)"
+# The other end of the same question. Taken from docker's own record of what the
+# container was created from rather than a boxy label, so it cannot drift.
+assert_contains "info reports the image a box is on" "image       boxy-base:latest" \
+    "$(boxy info boxy-1)"
+
 # An image boxy could build, but has not — the error should be actionable.
 out="$(boxy create "$WORK" -n vimg --image boxy-nope-full:latest 2>&1)"
 assert_contains "a missing image names the build flag that makes it" \

@@ -40,6 +40,7 @@ CORE
   forward [NAME] [PORTS]     tunnel box ports to the SAME local ports
   rm NAME...                 remove a box (doesn't touch your files)
   ls                         list boxes
+  images [-v]                build variants, which are built, what runs on them
   info [NAME]                one box in detail, config vs reality
   password [NAME]            print the stored sudo password
   env [NAME] [K=V ...]       list or set/inject env vars
@@ -797,7 +798,7 @@ working, but it normalises to `docker-default`.
 ```
 
 ```
-core: 88 passed, 0 failed
+core: 108 passed, 0 failed
 network: 65 passed, 0 failed
 workflow: 114 passed, 0 failed
 
@@ -809,14 +810,14 @@ workflow: 114 passed, 0 failed
 all suites passed
 ```
 
-267 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
+287 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
 under `$TMPDIR` with their own keypair, so they cannot touch a real install or
 your `~/.ssh` — though they *do* remove every boxy-managed container on the
 host, since a shared Docker daemon is the one resource they cannot sandbox.
 
 | Suite | Covers |
 | --- | --- |
-| `core` | creation, the box interior, the volume, sudo, sshd hardening, host-key pinning, capability policy, symlinked install, rollback of a failed create, the zsh login shell and its prompt, variant image tagging |
+| `core` | creation, the box interior, the volume, sudo, sshd hardening, host-key pinning, capability policy, symlinked install, rollback of a failed create, the zsh login shell and its prompt, variant image tagging, `boxy images` |
 | `network` | `--net none` / `--net limited`, DNS and on-link hardening, restart persistence, the allowlist and `boxy allow`, domain validation, teardown |
 | `workflow` | ports and `-p`, forwarding, `ssh_config`, `exec`, `boxy env`, the rm/workdir contract |
 

@@ -90,6 +90,7 @@ trust-on-first-use prompt, and no `StrictHostKeyChecking=no`.
 | `boxy forward [NAME] [PORTS]` | Tunnel box ports to the _same_ localhost numbers; `--bg` / `--stop` to run it in the background |
 | `boxy rm NAME...`             | Remove a box; never touches your files                |
 | `boxy ls`                     | List boxes with status, SSH port, net mode, workdir   |
+| `boxy images [-v]`            | Build variants, which are built, and what runs on them |
 | `boxy info [NAME]`            | One box in detail, config and actual state            |
 | `boxy password [NAME]`        | Print the stored sudo password                        |
 | `boxy env [NAME] [K=V]`       | Set/inject or list environment variables the box sees |
@@ -873,12 +874,28 @@ made:
 `BOXY_IMAGE`. That is the whole rule — a name always means one stack, so there
 is never a question of what you are about to run. The cost is that building a
 variant does not silently become your default; you say which one you want, once,
-and `boxy doctor` lists what you have:
+and `boxy images` shows the whole picture:
 
 ```
-  image boxy-base:latest   present (default)
-  image boxy-full:latest   present
+$ boxy images
+
+VARIANT         IMAGE                      SIZE     BUILT              IN USE
+base (default)  boxy-base:latest           2.25GB   About an hour ago  2 boxes, 2 running
+extras          boxy-extras:latest         -        not built          none
+claude          boxy-claude:latest         2.54GB   About an hour ago  1 box, 0 running
+full            boxy-full:latest           -        not built          none
+
+sidecar         boxy-internalproxy:latest  115MB    About an hour ago  1 (boxy managed)
 ```
+
+Every variant appears whether or not you have built it, because "have I built
+the full one?" is not a question a list of what exists can answer. The sidecar
+is counted too — that number is worth knowing — but sits apart and carries no
+running split, because a sidecar is up exactly when its box is. Its count needs
+no noun either, the row having already said `sidecar`, which leaves
+`(boxy managed)` against the number it qualifies. `IN USE` counts rather than naming — a bare `2` in that column would read as
+`boxy-2`, and a name list has no bounded width — so `boxy images -v` names them,
+and `boxy info` reports the image from the other end, per box.
 
 Each image also carries a `boxy.variant` label, which is what identifies it if
 you retag it or set `BOXY_IMAGE` to a name of your own.
