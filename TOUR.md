@@ -80,7 +80,7 @@ boxy 1.0.0
   docker cli               29.6.2
   docker daemon            reachable
   image boxy-base:latest   present (default)
-  image boxy-proxy:latest  present
+  sidecar image            present (boxy-internalproxy:latest)
   boxy keypair             not yet generated (created on first boxy create)
   EFF wordlist             not cached (fetched on first create)
   config                   ~/.config/boxy/config
@@ -797,7 +797,7 @@ working, but it normalises to `docker-default`.
 ```
 
 ```
-core: 86 passed, 0 failed
+core: 88 passed, 0 failed
 network: 65 passed, 0 failed
 workflow: 114 passed, 0 failed
 
@@ -809,7 +809,7 @@ workflow: 114 passed, 0 failed
 all suites passed
 ```
 
-265 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
+267 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
 under `$TMPDIR` with their own keypair, so they cannot touch a real install or
 your `~/.ssh` — though they *do* remove every boxy-managed container on the
 host, since a shared Docker daemon is the one resource they cannot sandbox.

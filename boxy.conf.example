@@ -31,7 +31,11 @@
 # The build names follow this too: with BOXY_IMAGE=myimg:v2, `boxy build --full`
 # produces myimg-full:v2.
 #BOXY_IMAGE=boxy-base:latest
-#BOXY_PROXY_IMAGE=boxy-proxy:latest
+
+# The egress sidecar's image. Not a box image and not a build variant — boxy
+# starts it alongside a `--net limited` or `--net none` box, and it is never
+# something to pass to `boxy create --image`.
+#BOXY_PROXY_IMAGE=boxy-internalproxy:latest
 
 # --- networking -----------------------------------------------------------
 

@@ -24,7 +24,7 @@ boxyboy@boxy-2:/work$
 ## Quick start
 
 ```bash
-./boxy build          # builds boxy-base:latest and boxy-proxy:latest (~7 min, 2.25 GB)
+./boxy build          # boxy-base:latest + the egress sidecar (~7 min, 2.25 GB)
 ./boxy config --init  # writes ~/.config/boxy/config and the egress allowlist
 ./boxy create .       # mount the current directory at /work
 ./boxy ls
@@ -864,7 +864,7 @@ All four can sit side by side, and the build tells you how to use what it just
 made:
 
 ```
-✓ built boxy-full:latest (2.72 GB), boxy-proxy:latest
+✓ built boxy-full:latest (2.72 GB), boxy-internalproxy:latest
 
   boxy create . --image boxy-full:latest
 ```

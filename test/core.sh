@@ -267,6 +267,18 @@ assert_eq "and the others name theirs" " --full" "$(build_flag_for boxy-full:lat
 # image it did not just build.
 DEF_IMG="$(boxy config | awk '$1=="BOXY_IMAGE"{print $2}')"
 assert_eq "the default image is the base variant, by name" "boxy-base:latest" "$DEF_IMG"
+# The egress sidecar's image must not be reachable by the variant naming
+# scheme. If it were, `boxy create --image <that name>` would look like a fifth
+# stack and would start a box from a tinyproxy image.
+PROXY_IMG="$(boxy config | awk '$1=="BOXY_PROXY_IMAGE"{print $2}')"
+collides="no"
+for v in base extras claude full; do
+    [ "$PROXY_IMG" = "$(variant_image "$DEF_IMG" "$v")" ] && collides="yes [$v]"
+done
+assert_eq "the sidecar image is not shaped like a box variant" "no" "$collides"
+# And it is presented by its role, so it does not read as one more thing to run.
+assert_contains "doctor calls it a sidecar, not another image" \
+    "sidecar image            present" "$(boxy doctor)"
 assert_eq "the built image records which variant it is" "base" \
     "$(docker image inspect -f '{{index .Config.Labels "boxy.variant"}}' boxy-base:latest)"
 # doctor lists the variants present and marks the one create will use, rather

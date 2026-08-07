@@ -61,7 +61,14 @@ BOXY_CONFIG_DIR="${BOXY_CONFIG_DIR:-$HOME/.config/boxy}"
 # that moves with the last build, so this names one specific stack. Point it at
 # another variant to change what `boxy create` gives you without a flag.
 : "${BOXY_IMAGE:=boxy-base:latest}"
-: "${BOXY_PROXY_IMAGE:=boxy-proxy:latest}"
+# The egress sidecar's image.
+#
+# Deliberately not a boxy-<word> name. The box images are boxy-base, boxy-extras,
+# boxy-claude and boxy-full, so anything matching that shape reads as a fifth
+# variant and invites `boxy create --image boxy-proxy:latest`, which would start
+# a box from a tinyproxy image. Nothing runs a box from this; boxy starts it
+# alongside a `--net limited` or `--net none` box on its own.
+: "${BOXY_PROXY_IMAGE:=boxy-internalproxy:latest}"
 : "${BOXY_USER:=boxyboy}"
 
 # Where a box's workdir goes when you don't pass -d. The OS reaps temp
@@ -2358,11 +2365,15 @@ cmd_doctor() {
         printf '  %-24s %s\n' "image $BOXY_IMAGE" \
             "present (default)${variant:+ — built as $variant}"
     fi
+    # Labelled by its role rather than listed as another "image NAME" row: it is
+    # not one of the box images above and is never something to pass to
+    # --image. Its name goes in the parenthesis, where a customised
+    # BOXY_PROXY_IMAGE still shows up.
     if image_exists "$BOXY_PROXY_IMAGE"; then
-        printf '  %-24s %s\n' "image $BOXY_PROXY_IMAGE" "present"
+        printf '  %-24s %s\n' "sidecar image" "present ($BOXY_PROXY_IMAGE)"
     else
-        printf '  %-24s %smissing%s (boxy build)\n' "image $BOXY_PROXY_IMAGE" \
-            "$C_YEL" "$C_OFF"
+        printf '  %-24s %smissing%s (boxy build) (%s)\n' "sidecar image" \
+            "$C_YEL" "$C_OFF" "$BOXY_PROXY_IMAGE"
     fi
 
     if [ -f "$BOXY_SSH_KEY.pub" ]; then
