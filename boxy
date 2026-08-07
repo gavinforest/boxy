@@ -653,9 +653,9 @@ usage: boxy build [--no-cache] [--full | --extras | --claude]
   --claude    + @anthropic-ai/claude-code inside the box    (+291 MB)
   --full      both of the above
 
-Anything omitted is still one `uv install` away inside a running box.
+Anything omitted is still `uv install`able inside a running box.
 
-Each build is named for what is in it, so all four can sit side by side:
+Each build image is named for what's in it, so all four can coexist:
 
   (default)  boxy-base:latest      --claude  boxy-claude:latest
   --extras   boxy-extras:latest    --full    boxy-full:latest
@@ -1477,7 +1477,7 @@ write_known_hosts() {
     local name="$1" sdir port pubfile
     sdir="$(state_dir_for "$name")"
     port="$(inst_label "$name" boxy.ssh_port)"
-    : > "$sdir/known_hosts"
+    : > "$sdir/known_hosts" #clear it first
     for pubfile in "$sdir"/hostkeys/*.pub; do
         [ -f "$pubfile" ] || continue
         printf '[%s]:%s %s\n' "127.0.0.1" "$port" "$(cut -d' ' -f1,2 < "$pubfile")" \
