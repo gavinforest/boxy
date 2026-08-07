@@ -227,6 +227,57 @@ assert_contains "so does a relative link to a link" "wrote" \
     "$(BOXY_CONFIG_DIR="$TEST_TMP/symcfg2" "$TEST_TMP/bin/boxy-relative" config --init 2>&1)"
 rm -rf "$TEST_TMP/bin" "$TEST_TMP/symcfg1" "$TEST_TMP/symcfg2"
 
+section "builds are tagged and labelled by variant"
+# The naming rules are pure string work, so they are exercised directly rather
+# than by running four 2 GB builds. Extracted rather than sourced, because boxy
+# dispatches as soon as it is loaded; the first assertion is the guard that
+# stops a rename from making the whole section pass against nothing.
+VFN="$TEST_TMP/variant.fn"
+sed -n -e '/^image_repo()/,/^}/p'       -e '/^image_tag()/,/^}/p' \
+       -e '/^is_variant_image()/,/^}/p' -e '/^variant_image()/,/^}/p' \
+       -e '/^build_flag_for()/,/^}/p'   "$BOXY" > "$VFN"
+. "$VFN"
+assert_eq "the naming helpers were found" "function" "$(type -t variant_image)"
+assert_eq "the suffix goes on the repository, not the tag" "boxy-full:latest" \
+    "$(variant_image boxy:latest full)"
+assert_eq "the default build is named too, not left bare" "boxy-base:latest" \
+    "$(variant_image boxy:latest base)"
+# In `localhost:5000/boxy` the colon is a registry port. Splitting on the last
+# colon in the whole string would yield a repository of "localhost".
+assert_eq "a registry port is not mistaken for a tag" "localhost:5000/boxy-extras:v2" \
+    "$(variant_image localhost:5000/boxy:v2 extras)"
+# BOXY_IMAGE=boxy-full:latest is a reasonable config for someone who wants the
+# fat image everywhere. Without stripping first, --full would tag boxy-full-full.
+assert_eq "a name that is already a variant is not doubled" "boxy-full:latest" \
+    "$(variant_image boxy-full:latest full)"
+assert_eq "a neutral name is not a variant name" "no" \
+    "$(is_variant_image boxy:latest && echo yes || echo no)"
+assert_eq "a variant tag is recognised as one" "yes" \
+    "$(is_variant_image boxy-claude:latest && echo yes || echo no)"
+# So that a missing image names the command that produces it, rather than a
+# generic `boxy build` that would rebuild the wrong variant.
+assert_eq "base needs no flag" "" "$(build_flag_for boxy-base:latest)"
+assert_eq "and the others name theirs" " --full" "$(build_flag_for boxy-full:latest)"
+
+# The rest is about the image this suite runs against, which setup_env has
+# already required, so it costs no build time.
+#
+# There is deliberately no boxy:latest alias: every image boxy builds is named
+# for what is in it. The label carries the same fact for anything looking at an
+# image it did not just build.
+DEF_IMG="$(boxy config | awk '$1=="BOXY_IMAGE"{print $2}')"
+assert_eq "the default image is the base variant, by name" "boxy-base:latest" "$DEF_IMG"
+assert_eq "the built image records which variant it is" "base" \
+    "$(docker image inspect -f '{{index .Config.Labels "boxy.variant"}}' boxy-base:latest)"
+# doctor lists the variants present and marks the one create will use, rather
+# than confirming a single name that could hold anything.
+assert_contains "doctor marks which image is the default" \
+    "image boxy-base:latest   present (default)" "$(boxy doctor)"
+# An image boxy could build, but has not — the error should be actionable.
+out="$(boxy create "$WORK" -n vimg --image boxy-nope-full:latest 2>&1)"
+assert_contains "a missing image names the build flag that makes it" \
+    "boxy build --full" "$out"
+
 section "a create that fails partway undoes what it had made"
 # The stages after create_prepare_dirs can all fail — docker runs out of
 # address pools after a couple of dozen isolated boxes — and until an EXIT
@@ -241,7 +292,7 @@ rm -rf "$RBREPO"; mkdir -p "$RBREPO"
     && git config user.name Tester && git commit -q --allow-empty -m base ) >/dev/null 2>&1
 # `docker create`, not run: reserving the name is all that is needed, and a
 # container that never starts costs nothing to clean up.
-docker create --name boxy-sidecar-rb boxy:latest >/dev/null 2>&1
+docker create --name boxy-sidecar-rb boxy-base:latest >/dev/null 2>&1
 out="$( cd "$RBREPO" && boxy create worktree -n rb --net none 2>&1 )"
 assert_contains "it says it is undoing the work" "undoing what it had already made" "$out"
 assert_empty "the state directory is gone" \

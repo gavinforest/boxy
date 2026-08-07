@@ -79,7 +79,7 @@ boxy 1.0.0
 
   docker cli               29.6.2
   docker daemon            reachable
-  image boxy:latest        present
+  image boxy-base:latest   present (default)
   image boxy-proxy:latest  present
   boxy keypair             not yet generated (created on first boxy create)
   EFF wordlist             not cached (fetched on first create)
@@ -797,7 +797,7 @@ working, but it normalises to `docker-default`.
 ```
 
 ```
-core: 73 passed, 0 failed
+core: 86 passed, 0 failed
 network: 65 passed, 0 failed
 workflow: 114 passed, 0 failed
 
@@ -809,14 +809,14 @@ workflow: 114 passed, 0 failed
 all suites passed
 ```
 
-252 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
+265 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
 under `$TMPDIR` with their own keypair, so they cannot touch a real install or
 your `~/.ssh` — though they *do* remove every boxy-managed container on the
 host, since a shared Docker daemon is the one resource they cannot sandbox.
 
 | Suite | Covers |
 | --- | --- |
-| `core` | creation, the box interior, the volume, sudo, sshd hardening, host-key pinning, capability policy, symlinked install, rollback of a failed create, the zsh login shell and its prompt |
+| `core` | creation, the box interior, the volume, sudo, sshd hardening, host-key pinning, capability policy, symlinked install, rollback of a failed create, the zsh login shell and its prompt, variant image tagging |
 | `network` | `--net none` / `--net limited`, DNS and on-link hardening, restart persistence, the allowlist and `boxy allow`, domain validation, teardown |
 | `workflow` | ports and `-p`, forwarding, `ssh_config`, `exec`, `boxy env`, the rm/workdir contract |
 

@@ -85,8 +85,8 @@ setup_env() {
     mkdir -p "$TEST_TMP" "$BOXY_STATE_DIR" "$BOXY_CONFIG_DIR"
     command -v docker >/dev/null 2>&1 || { echo "docker not on PATH" >&2; exit 2; }
     docker info >/dev/null 2>&1 || { echo "docker daemon unreachable" >&2; exit 2; }
-    docker image inspect boxy:latest >/dev/null 2>&1 \
-        || { echo "boxy:latest missing — run ./boxy build" >&2; exit 2; }
+    docker image inspect boxy-base:latest >/dev/null 2>&1 \
+        || { echo "boxy-base:latest missing — run ./boxy build" >&2; exit 2; }
     purge_all
 }
 

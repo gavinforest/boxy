@@ -22,7 +22,15 @@
 #BOXY_USER=boxyboy
 
 # --- images ---------------------------------------------------------------
-#BOXY_IMAGE=boxy:latest
+# Which variant `boxy create` gets without --image. Every image boxy builds is
+# named for what is in it — boxy-base, boxy-extras, boxy-claude, boxy-full —
+# and none of them moves, so this names one specific stack:
+#
+#   BOXY_IMAGE=boxy-full:latest
+#
+# The build names follow this too: with BOXY_IMAGE=myimg:v2, `boxy build --full`
+# produces myimg-full:v2.
+#BOXY_IMAGE=boxy-base:latest
 #BOXY_PROXY_IMAGE=boxy-proxy:latest
 
 # --- networking -----------------------------------------------------------

@@ -56,7 +56,11 @@ BOXY_CONFIG_DIR="${BOXY_CONFIG_DIR:-$HOME/.config/boxy}"
 
 # Defaults, applied only where the config file / environment leave a gap.
 : "${BOXY_STATE_DIR:=$HOME/.local/share/boxy}"
-: "${BOXY_IMAGE:=boxy:latest}"
+# The default box image. Every image boxy builds is named for what is in it —
+# boxy-base, boxy-extras, boxy-claude, boxy-full — and there is no short alias
+# that moves with the last build, so this names one specific stack. Point it at
+# another variant to change what `boxy create` gives you without a flag.
+: "${BOXY_IMAGE:=boxy-base:latest}"
 : "${BOXY_PROXY_IMAGE:=boxy-proxy:latest}"
 : "${BOXY_USER:=boxyboy}"
 
@@ -222,6 +226,79 @@ require_docker() {
 }
 
 image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
+
+# Which build made an image: base | extras | claude | full.
+#
+# Empty for the proxy image, for anything not built by boxy, and for a boxy
+# image built before this label existed — all three are "no answer", and none
+# is worth distinguishing. `index` on a missing (or nil) label map yields the
+# empty string rather than Go's <no value>, so no filtering is needed.
+image_variant() {
+    docker image inspect -f '{{index .Config.Labels "boxy.variant"}}' "$1" 2>/dev/null
+}
+
+# Split an image reference. A registry host may carry a port
+# (localhost:5000/boxy), so a colon only means "tag" when it is in the last path
+# segment — which is why these are functions and not two parameter expansions
+# written out wherever they are needed.
+image_repo() {
+    case "${1##*/}" in
+        *:*) printf '%s\n' "${1%:*}" ;;
+        *)   printf '%s\n' "$1"      ;;
+    esac
+}
+image_tag() {
+    case "${1##*/}" in
+        *:*) printf '%s\n' "${1##*:}" ;;
+        *)   printf '%s\n' "latest"   ;;
+    esac
+}
+
+# " (2.54 GB)" to close out a build, or nothing if docker will not say. Decimal
+# GB so the number matches what `docker images` prints for the same image.
+image_size_note() {
+    local bytes
+    bytes="$(docker image inspect -f '{{.Size}}' "$1" 2>/dev/null)" || return 0
+    [ -n "$bytes" ] || return 0
+    awk -v b="$bytes" 'BEGIN { printf " (%.2f GB)", b/1000000000 }'
+}
+
+# The `boxy build` flag that produces a given image, so a "not found" can name
+# the command that fixes it instead of a generic one. Empty for base, and for
+# any name that is not one of boxy's own.
+build_flag_for() {
+    case "$(image_repo "$1")" in
+        *-extras) printf ' --extras' ;;
+        *-claude) printf ' --claude' ;;
+        *-full)   printf ' --full'   ;;
+        *) ;;
+    esac
+}
+
+# Is this name already one of the tags `boxy build` writes? True for
+# boxy-full:latest, false for a bare boxy:latest. Used to avoid stacking a
+# second suffix on a name that has one.
+is_variant_image() {
+    case "$(image_repo "$1")" in
+        *-base|*-extras|*-claude|*-full) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# boxy:latest + full -> boxy-full:latest.
+#
+# The suffix goes on the repository rather than the tag. `docker images boxy-full`
+# then lists exactly one variant, `docker image rm boxy-extras` takes one away,
+# and the tag stays free for a version number later — none of which works if the
+# variant is the tag, because a repository's tags are one flat namespace.
+variant_image() {
+    local repo; repo="$(image_repo "$1")"
+    # BOXY_IMAGE=boxy-full:latest is a reasonable thing to put in a config, to
+    # make the fat image the default. Strip the suffix back off first, so that
+    # `boxy build --full` re-tags boxy-full and not boxy-full-full.
+    is_variant_image "$1" && repo="${repo%-*}"
+    printf '%s-%s:%s\n' "$repo" "$2" "$(image_tag "$1")"
+}
 
 # Unbiased random integer in [0,N) from /dev/urandom. Rejection sampling
 # rather than a plain modulo, because `rand % 7776` over 16 bits skews the
@@ -570,6 +647,17 @@ usage: boxy build [--no-cache] [--full | --extras | --claude]
   --full      both of the above
 
 Anything omitted is still one `uv install` away inside a running box.
+
+Each build is named for what is in it, so all four can sit side by side:
+
+  (default)  boxy-base:latest      --claude  boxy-claude:latest
+  --extras   boxy-extras:latest    --full    boxy-full:latest
+
+boxy create uses boxy-base:latest. To use another, name it:
+
+  boxy create . --image boxy-full:latest
+
+or set BOXY_IMAGE in the config to make that the default.
 EOF
                 return 0 ;;
             *) die "build: unknown option $1" ;;
@@ -577,18 +665,46 @@ EOF
         shift
     done
 
-    info "building $BOXY_IMAGE (extras=$extras claude-code=$claude)"
+    # The two flags are independent, so the name is the combination, not a
+    # ranking — --full is exactly --extras --claude and tags the same image.
+    local variant
+    case "$extras$claude" in
+        00) variant="base"   ;;
+        10) variant="extras" ;;
+        01) variant="claude" ;;
+        11) variant="full"   ;;
+    esac
+    local vimg; vimg="$(variant_image "$BOXY_IMAGE" "$variant")"
+
+    # One tag, and it states what is in the image.
+    #
+    # There is deliberately no second, moving `boxy:latest` alias. Two names for
+    # one image means the name you read is not the name that says what you have,
+    # and after a couple of builds nobody can tell what the short one currently
+    # holds. Every image boxy builds is called what it is, start to finish.
+    #
+    # boxy.variant carries the same fact in a label, for `boxy doctor` and for
+    # anything looking at an image it did not just build.
+    info "building $vimg"
     # shellcheck disable=SC2086
     docker build $nocache \
         --build-arg "INSTALL_EXTRAS=$extras" \
         --build-arg "INSTALL_CLAUDE_CODE=$claude" \
-        -t "$BOXY_IMAGE" -f "$SELF_DIR/Dockerfile" "$SELF_DIR"
+        --label "boxy.variant=$variant" \
+        -t "$vimg" -f "$SELF_DIR/Dockerfile" "$SELF_DIR"
 
     info "building $BOXY_PROXY_IMAGE"
     # shellcheck disable=SC2086
     docker build $nocache -t "$BOXY_PROXY_IMAGE" -f "$SELF_DIR/docker/Dockerfile.proxy" "$SELF_DIR"
 
-    ok "images ready: $BOXY_IMAGE, $BOXY_PROXY_IMAGE"
+    ok "built $vimg$(image_size_note "$vimg"), $BOXY_PROXY_IMAGE"
+    # How to actually use what was just built. Omitted when it is already the
+    # default, because `boxy create . --image boxy-base:latest` would be telling
+    # you to type out something boxy would have done anyway.
+    if [ "$vimg" != "$BOXY_IMAGE" ]; then
+        printf '\n  boxy create . --image %s\n\n' "$vimg"
+        note "or set BOXY_IMAGE=$vimg in $(config_file) to make it the default"
+    fi
 }
 
 # ===========================================================================
@@ -621,7 +737,8 @@ options:
                           -p 2718       -> localhost:2718 -> box 2718
                           -p 12718:2718 -> localhost:12718 -> box 2718
                         Default is none; use `boxy forward` instead.
-      --image IMG       image to run (default: boxy:latest)
+      --image IMG       image to run (default: boxy-base:latest; the others are
+                        boxy-extras, boxy-claude and boxy-full, same :latest)
       --cpus N          CPU limit
       --memory SIZE     memory limit, e.g. 8g
 
@@ -853,7 +970,8 @@ create_validate() {
     fi
     create_resolve_target
 
-    image_exists "$NB_IMAGE" || die "image '$NB_IMAGE' not found — run: boxy build"
+    image_exists "$NB_IMAGE" \
+        || die "image '$NB_IMAGE' not found — run: boxy build$(build_flag_for "$NB_IMAGE")"
     if [ "$NB_NET" = "limited" ]; then
         image_exists "$BOXY_PROXY_IMAGE" \
             || die "proxy image '$BOXY_PROXY_IMAGE' not found — run: boxy build"
@@ -2214,14 +2332,38 @@ cmd_doctor() {
         printf '  %-24s %sMISSING%s\n' "docker cli" "$C_RED" "$C_OFF"; problems=$(( problems + 1 ))
     fi
 
-    local img
-    for img in "$BOXY_IMAGE" "$BOXY_PROXY_IMAGE"; do
-        if image_exists "$img"; then
-            printf '  %-24s %s\n' "image $img" "present"
-        else
-            printf '  %-24s %smissing%s (boxy build)\n' "image $img" "$C_YEL" "$C_OFF"
+    # Which box images exist, by name — all four variants can be present at
+    # once, and `boxy create` picks one of them, so listing them is more use
+    # than confirming a single name.
+    local img variant mark listed=0
+    for variant in base extras claude full; do
+        img="$(variant_image "$BOXY_IMAGE" "$variant")"
+        image_exists "$img" || continue
+        mark=""
+        if [ "$img" = "$BOXY_IMAGE" ]; then
+            mark=" (default)"
+            listed=1
         fi
+        printf '  %-24s %s\n' "image $img" "present$mark"
     done
+    # $BOXY_IMAGE gets its own line when the loop above did not cover it: either
+    # it is missing — the one thing here that stops `boxy create` working — or it
+    # is a custom name none of boxy's own patterns match, in which case the
+    # boxy.variant label is the only thing that says what is inside it.
+    if ! image_exists "$BOXY_IMAGE"; then
+        printf '  %-24s %smissing%s (boxy build%s)\n' "image $BOXY_IMAGE" \
+            "$C_YEL" "$C_OFF" "$(build_flag_for "$BOXY_IMAGE")"
+    elif [ "$listed" = 0 ]; then
+        variant="$(image_variant "$BOXY_IMAGE")"
+        printf '  %-24s %s\n' "image $BOXY_IMAGE" \
+            "present (default)${variant:+ — built as $variant}"
+    fi
+    if image_exists "$BOXY_PROXY_IMAGE"; then
+        printf '  %-24s %s\n' "image $BOXY_PROXY_IMAGE" "present"
+    else
+        printf '  %-24s %smissing%s (boxy build)\n' "image $BOXY_PROXY_IMAGE" \
+            "$C_YEL" "$C_OFF"
+    fi
 
     if [ -f "$BOXY_SSH_KEY.pub" ]; then
         printf '  %-24s %s\n' "boxy keypair" "$BOXY_SSH_KEY"

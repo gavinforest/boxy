@@ -24,7 +24,7 @@ boxyboy@boxy-2:/work$
 ## Quick start
 
 ```bash
-./boxy build          # builds boxy:latest and boxy-proxy:latest (~7 min, 2.3 GB)
+./boxy build          # builds boxy-base:latest and boxy-proxy:latest (~7 min, 2.25 GB)
 ./boxy config --init  # writes ~/.config/boxy/config and the egress allowlist
 ./boxy create .       # mount the current directory at /work
 ./boxy ls
@@ -839,13 +839,55 @@ loader would not. The entrypoint writes those into `~/.zshenv`, which zsh reads
 on *every* invocation, so one file covers both an interactive `ssh box` and a
 non-interactive `ssh box cmd`. Bash needs two files for the same job.
 
-Opt-in, because they are large and not everyone wants them in every box:
+### Build variants
+
+Two additions are opt-in, because they are large and not everyone wants them in
+every box:
 
 ```bash
 boxy build --extras   # jupyterlab polars pyarrow scikit-learn   (+462 MB)
 boxy build --claude   # @anthropic-ai/claude-code                (+291 MB)
 boxy build --full     # both
 ```
+
+**Every image is named for what is in it.** There is no `boxy:latest`, and
+nothing moves:
+
+| Build | Image |
+| --- | --- |
+| `boxy build` | `boxy-base:latest` |
+| `boxy build --extras` | `boxy-extras:latest` |
+| `boxy build --claude` | `boxy-claude:latest` |
+| `boxy build --full` | `boxy-full:latest` |
+
+All four can sit side by side, and the build tells you how to use what it just
+made:
+
+```
+✓ built boxy-full:latest (2.72 GB), boxy-proxy:latest
+
+  boxy create . --image boxy-full:latest
+```
+
+`boxy create` uses **`boxy-base:latest`** unless you pass `--image` or set
+`BOXY_IMAGE`. That is the whole rule — a name always means one stack, so there
+is never a question of what you are about to run. The cost is that building a
+variant does not silently become your default; you say which one you want, once,
+and `boxy doctor` lists what you have:
+
+```
+  image boxy-base:latest   present (default)
+  image boxy-full:latest   present
+```
+
+Each image also carries a `boxy.variant` label, which is what identifies it if
+you retag it or set `BOXY_IMAGE` to a name of your own.
+
+`BOXY_IMAGE` in your config sets which variant a plain `boxy create` gets, and
+the build names follow it: `BOXY_IMAGE=myimg:v2` makes `boxy build --full`
+produce `myimg-full:v2`. Setting it to `boxy-full:latest` is the ordinary way to
+make the fat image your default — and `boxy build --full` still writes
+`boxy-full:latest`, not `boxy-full-full:latest`.
 
 Installing into a running box works too, with **no `sudo` needed**: the conda
 prefix is owned by the box user. Verified working at runtime: `pip install`,

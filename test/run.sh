@@ -6,7 +6,7 @@
 #   ./test/run.sh core         # one suite
 #   ./test/run.sh core network
 #
-# Requires a reachable Docker daemon and a built boxy:latest. Runs entirely
+# Requires a reachable Docker daemon and a built boxy-base:latest. Runs entirely
 # against a scratch state directory under $TMPDIR, so it cannot disturb a real
 # install — but it DOES remove every boxy-managed container on the host, since
 # a shared daemon is the one resource it cannot sandbox.
