@@ -164,15 +164,14 @@ boxy create -n plaincaps --caps docker-default >/dev/null 2>&1
 assert_contains "restores the full docker set" "cap_mknod" "$(caps_of plaincaps)"
 assert_contains "a bad value is rejected" "--caps must be one of" \
     "$(boxy create -n bogus --caps nonsense 2>&1)"
-# `default` was the old spelling and is still accepted, silently, so existing
-# configs keep working. It normalises so the label never shows the old name.
-boxy rm plaincaps >/dev/null 2>&1
-boxy create -n oldcaps --caps default >/dev/null 2>&1
-assert_eq "the old 'default' spelling still works" "docker-default" \
-    "$(boxy info oldcaps | awk '/^caps/{print $2}')"
-assert_contains "and grants the same set" "cap_mknod" "$(caps_of oldcaps)"
-boxy rm oldcaps >/dev/null 2>&1
-boxy create -n plaincaps --caps docker-default >/dev/null 2>&1
+# `default` was the old spelling of `docker-default`, and it is rejected rather
+# than aliased. The name read as "boxy's default" but meant the opposite set, a
+# difference of ten capabilities — so the error has to name the replacement
+# instead of silently handing them over.
+oldcaps_err="$(boxy create -n oldcaps --caps default 2>&1)"
+assert_contains "the old 'default' spelling is rejected" "old spelling" "$oldcaps_err"
+assert_contains "and the error names the replacement" "docker-default" "$oldcaps_err"
+assert_empty "nothing was created" "$(docker ps -aq -f name='^oldcaps$')"
 # Release the instance slot again so the port assertion below still describes
 # "the second box", not "the fourth".
 boxy rm plaincaps >/dev/null 2>&1

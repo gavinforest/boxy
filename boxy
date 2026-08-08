@@ -947,13 +947,16 @@ create_validate() {
         full|none|limited) ;;
         *) die "--net must be one of: full, none, limited" ;;
     esac
-    # `default` is the old spelling of `docker-default`. It was a bad name: it
-    # meant "Docker's default set", but boxy's default is `minimal`, so the
-    # value named `default` was the one you never got by default. Still
-    # accepted, silently, so existing configs and scripts keep working.
-    [ "$NB_CAPS" = "default" ] && NB_CAPS="docker-default"
     case "$NB_CAPS" in
         minimal|docker-default) ;;
+        # `default` is the old spelling of `docker-default`, and it read
+        # backwards: it meant "Docker's default set", but boxy's default is
+        # `minimal`, so the value named `default` was the one you never got by
+        # default. Named here rather than quietly aliased, because the two
+        # readings differ by ten capabilities and the wrong one fails open —
+        # anyone who writes `default` meaning "whatever boxy does normally"
+        # must be told they asked for the opposite, not handed it.
+        default) die "--caps must be one of: minimal, docker-default — 'default' was the old spelling of 'docker-default', and boxy's own default is 'minimal'" ;;
         *) die "--caps must be one of: minimal, docker-default" ;;
     esac
 

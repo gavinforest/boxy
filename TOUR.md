@@ -799,8 +799,9 @@ binding port 80 as an unprivileged user, `pip install`, and `git commit`.
 to rule capabilities in or out when something misbehaves. Note which is which:
 `minimal` is boxy's default, and `docker-default` names Docker's own set. The
 value used to be spelled `default`, which read backwards — it named the set you
-never got by default. That spelling is still accepted so old configs keep
-working, but it normalises to `docker-default`.
+never got by default. That spelling is rejected outright, with an error naming
+the replacement: it differs from boxy's actual default by ten capabilities, and
+guessing wrong about which one you get is not a mistake worth being quiet about.
 
 ---
 

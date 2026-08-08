@@ -726,9 +726,10 @@ boxy create --caps docker-default   # Docker's full 14
 
 Note which is which: **`minimal` is boxy's default; `docker-default` means
 Docker's own set.** The value was originally spelled `default`, which read
-backwards — it named the set you never got by default. `default` is still
-accepted as a silent alias so existing configs keep working, but it normalises
-to `docker-default` and that is what `boxy info` reports.
+backwards — it named the set you never got by default. That spelling is now
+rejected rather than quietly accepted: the two readings differ by ten
+capabilities, so anyone writing `default` to mean "whatever boxy does normally"
+is told they asked for the opposite instead of being handed it.
 
 That's the fastest way to confirm or rule out capabilities as the cause. To
 grant one specific capability without abandoning the reduced set, add it to
