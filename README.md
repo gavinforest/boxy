@@ -40,6 +40,8 @@ from the repository rather than from wherever the link happens to sit.
 ln -s "$PWD/boxy" /usr/local/bin/boxy
 ```
 
+See [TOUR.md](TOUR.md) for a more detailed walkthrough.
+
 ---
 
 ## How it works
