@@ -475,13 +475,32 @@ $ boxy forward boxy-1 --stop
 stopped tunnel for boxy-1
 ```
 
-`--stop` takes no port because one `--bg`
-tunnel per box carries every port, so stopping it stops them all.
-Ports are positional arguments — `boxy forward [NAME] [--bg|--stop] [PORT ...]`
-— and omitting them forwards boxy's default list.
+`--stop` takes no port: it ends every tunnel recorded for the box. Stopping one
+of several would leave the rest running with no way left to name them. Ports
+are positional arguments — `boxy forward [NAME] [--bg|--stop] [PORT ...]` — and
+omitting them forwards boxy's default list.
 
-Asking for a port that is already tunnelled is refused, so running the same
-`--bg` command twice costs you nothing:
+`--bg` is **additive**. A second call adds ports to what is already tunnelled
+rather than replacing it, and a port an earlier tunnel already holds is skipped
+with a warning rather than treated as an error:
+
+```
+$ boxy forward boxy-1 --bg 8000
+tunnelling 8000 in the background (boxy forward boxy-1 --stop to end)
+
+$ boxy forward boxy-1 --bg 8000 8080
+warning: localhost:8000 is already in use — skipping
+tunnelling 8080 in the background (boxy forward boxy-1 --stop to end)
+1 other tunnel(s) already up for boxy-1 — --stop ends all of them
+
+$ boxy forward boxy-1 --stop
+stopped 2 tunnels for boxy-1
+```
+
+Note that the message names 8080 alone: what a call reports is what it actually
+tunnelled, not what you asked for. If every port you name is already up there is
+nothing left to do, and the command says so rather than starting an empty
+tunnel:
 
 ```
 $ boxy forward boxy-1 --bg 8000
@@ -489,22 +508,15 @@ warning: localhost:8000 is already in use — skipping
 error: no ports available to forward
 ```
 
-> **A second `--bg` with *different* ports is a trap.** It starts a second
-> tunnel and overwrites the same `forward.pid`, so the record of the first one
-> is lost. `--stop` then ends only the newer tunnel; the older one keeps
-> serving its ports with nothing tracking it, and a second `--stop` reports
-> `no background tunnel recorded`. Forward every port you want in one command,
-> or clean up with `pkill -f "ssh -F.*<name>"`.
-
 The pid bookkeeping exists only because of `--bg`. Without it, `boxy forward`
 runs in the foreground and you stop it with `Ctrl-C`. With it, boxy starts
-`ssh -N -T` with its output redirected to `<state>/forward.log`, detaches it
+`ssh -N -T` with its output appended to `<state>/forward.log`, detaches it
 from the terminal and returns — leaving a plain background process that nothing
-is waiting on, so boxy records its pid in `<state>/forward.pid` to be able to
-find it again. But that tunnel can also die on its own — a dropped network,
-`ExitOnForwardFailure`, a reboot — which leaves the record pointing at a pid the
-OS is free to hand to something else. So `--stop` confirms the pid is still
-*that* tunnel before signalling it, rather than killing whatever now holds the
+is waiting on, so boxy appends its pid to the list in `<state>/forward.pid`.
+But a tunnel can also die on its own — a dropped network,
+`ExitOnForwardFailure`, a reboot — which leaves a record pointing at a pid the
+OS is free to hand to something else. So each pid is confirmed to still be
+*that* tunnel before it is signalled, rather than killing whatever now holds the
 number:
 
 ```

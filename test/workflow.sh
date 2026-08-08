@@ -31,6 +31,7 @@ assert_contains "clear error, no container left behind" "already in use" \
 assert_empty "nothing was created" "$(docker ps -aq -f name='^dup$')"
 
 section "boxy forward keeps the number identical"
+FWD_PIDFILE="$BOXY_STATE_DIR/instances/boxy-1/forward.pid"
 docker exec -d -u boxyboy boxy-1 sh -c 'cd /work && python -m http.server 8000 --bind 0.0.0.0'
 sleep 3
 boxy forward boxy-1 --bg 8000 >/dev/null 2>&1
@@ -42,12 +43,56 @@ sleep 1
 assert_eq "tunnel is gone after --stop" "000" \
     "$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8000/ 2>/dev/null)"
 
+# A second --bg over different ports used to overwrite the first tunnel's pid.
+# The first tunnel kept running with nothing recorded for it: --stop reaped only
+# the newest, and the older one was unreachable through boxy — you needed pkill.
+# --bg is additive, so the record is a list and --stop reaps all of it.
+section "a second --bg adds a tunnel instead of orphaning the first"
+docker exec -d -u boxyboy boxy-1 sh -c 'cd /work && python -m http.server 8080 --bind 0.0.0.0'
+sleep 3
+boxy forward boxy-1 --bg 8000 >/dev/null 2>&1
+sleep 3
+FWD_FIRST="$(cat "$FWD_PIDFILE")"
+fwd_second_out="$(boxy forward boxy-1 --bg 8080 2>&1)"
+sleep 3
+FWD_SECOND="$(tail -1 "$FWD_PIDFILE")"
+assert_contains "the second call says others are up" "other tunnel(s) already up" "$fwd_second_out"
+assert_eq "both pids are recorded" "2" "$(wc -l < "$FWD_PIDFILE" | tr -d ' ')"
+assert_eq "the first pid was not overwritten" "1" "$(grep -cx "$FWD_FIRST" "$FWD_PIDFILE")"
+assert_eq "the first tunnel still serves" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:8000/)"
+assert_eq "the second tunnel serves too" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:8080/)"
+assert_contains "one --stop reaps both" "stopped 2 tunnels" \
+    "$(boxy forward boxy-1 --stop 2>&1)"
+sleep 1
+assert_eq "the older tunnel is gone, not orphaned" "000" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8000/ 2>/dev/null)"
+assert_eq "the newer tunnel is gone too" "000" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8080/ 2>/dev/null)"
+# By pid rather than by pgrep: a developer running the suite may legitimately
+# have their own tunnels up, and this must assert about these two and no others.
+assert_eq "neither ssh client is left running" "gone gone" \
+    "$(for p in "$FWD_FIRST" "$FWD_SECOND"; do
+           ps -p "$p" >/dev/null 2>&1 && printf 'alive ' || printf 'gone '
+       done | sed 's/ $//')"
+
+# A port an earlier tunnel already holds is skipped, and has to drop out of the
+# message too — otherwise a repeat --bg claims to have forwarded it.
+boxy forward boxy-1 --bg 8000 >/dev/null 2>&1
+sleep 3
+fwd_skip_out="$(boxy forward boxy-1 --bg 8000 8080 2>&1)"
+sleep 2
+assert_contains "a port already tunnelled is skipped" "localhost:8000 is already in use" "$fwd_skip_out"
+assert_contains "and is not claimed as forwarded" "tunnelling 8080 in the background" "$fwd_skip_out"
+boxy forward boxy-1 --stop >/dev/null 2>&1
+sleep 1
+
 # --stop used to kill whatever the recorded pid now referred to. The pidfile
 # outlives a tunnel that died on its own, and pids get recycled, so that could
 # signal an unrelated process of yours. It has to confirm the pid is still the
 # tunnel — identified by ExitOnForwardFailure plus the box name — before
 # signalling anything.
-FWD_PIDFILE="$BOXY_STATE_DIR/instances/boxy-1/forward.pid"
 sleep 300 & FWD_INNOCENT=$!
 printf '%s\n' "$FWD_INNOCENT" > "$FWD_PIDFILE"
 assert_contains "a recycled pid is not signalled" "stale record" \

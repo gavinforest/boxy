@@ -2552,6 +2552,35 @@ forward_pid_is_tunnel() {
     return 1
 }
 
+# The pids of every tunnel still running for a box, one per line.
+#
+# forward.pid is a LIST, not a single pid, because `--bg` is additive: a second
+# `boxy forward NAME --bg 8080` alongside a live 8000 tunnel is the ordinary way
+# to add a port, and `port_free` is built for exactly that — it skips ports an
+# earlier tunnel already holds instead of failing. When the file held one pid,
+# that second call overwrote the first tunnel's record. The tunnel kept running
+# with nothing left pointing at it: `--stop` reaped only the newest, and the
+# older one could not be reached through boxy at all, only through `pkill`.
+#
+# A file written by an older boxy holds a single pid, which is a one-line list,
+# so nothing needs converting.
+#
+# Reading prunes. Every pid is checked against forward_pid_is_tunnel, so entries
+# for tunnels that died on their own never come back out.
+forward_live_pids() {
+    local name="$1" pidfile pid
+    pidfile="$(state_dir_for "$name")/forward.pid"
+    [ -f "$pidfile" ] || return 0
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        # `if` rather than `… && printf`: under `set -e` a pid that fails the
+        # check would make the list itself exit non-zero, and this runs inside a
+        # command substitution, so the caller would silently get a short list.
+        if forward_pid_is_tunnel "$pid" "$name"; then printf '%s\n' "$pid"; fi
+    done < "$pidfile"
+    return 0
+}
+
 cmd_forward() {
     require_docker
     local name="" bg=0 stop=0 want_ports=""
@@ -2578,15 +2607,32 @@ cmd_forward() {
 
     if [ "$stop" = "1" ]; then
         [ -f "$pidfile" ] || die "no background tunnel recorded for $name"
-        local pid; pid="$(cat "$pidfile" 2>/dev/null || true)"
-        if forward_pid_is_tunnel "$pid" "$name"; then
-            kill "$pid" 2>/dev/null || true
-            rm -f "$pidfile"
+        # --stop reaps every recorded tunnel, not just the newest. Stopping one
+        # of several would leave the rest running with no way to name them.
+        local pid stopped=0 stale=0 stale_pids=""
+        while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            if forward_pid_is_tunnel "$pid" "$name"; then
+                kill "$pid" 2>/dev/null || true
+                stopped=$((stopped + 1))
+            else
+                # Nothing was signalled: see forward_pid_is_tunnel.
+                stale=$((stale + 1))
+                stale_pids="$stale_pids $pid"
+            fi
+        done < "$pidfile"
+        rm -f "$pidfile"
+        if [ "$stopped" -gt 1 ]; then
+            ok "stopped $stopped tunnels for $name"
+        elif [ "$stopped" = "1" ]; then
             ok "stopped tunnel for $name"
+        elif [ "$stale" -gt 1 ]; then
+            note "no tunnels running for $name — cleared $stale stale records (pids$stale_pids)"
         else
-            # Nothing was signalled: see forward_pid_is_tunnel.
-            rm -f "$pidfile"
-            note "no tunnel running for $name — cleared a stale record (pid ${pid:-none})"
+            note "no tunnel running for $name — cleared a stale record (pid${stale_pids:- none})"
+        fi
+        if [ "$stopped" -gt 0 ] && [ "$stale" -gt 0 ]; then
+            note "also cleared $stale stale record(s) (pids$stale_pids)"
         fi
         return 0
     fi
@@ -2595,11 +2641,18 @@ cmd_forward() {
 
     # -L PORT:127.0.0.1:PORT keeps the number identical on both sides, which
     # is the point: a marimo server on :2718 in the box is on :2718 here.
-    local sshargs=() p
+    #
+    # got_ports is the ports actually being tunnelled, which is not $want_ports:
+    # anything skipped below has to drop out of the message too, or a repeat
+    # `--bg` claims to have forwarded ports an earlier tunnel is already
+    # holding. Each entry carries its own leading space, so the messages read
+    # right whether want_ports came from the argv loop or from $BOXY_PORTS.
+    local sshargs=() got_ports="" p
     for p in $want_ports; do
         port_free "$p" || { warn "localhost:$p is already in use — skipping"; continue; }
         sshargs[${#sshargs[@]}]="-L"
         sshargs[${#sshargs[@]}]="127.0.0.1:$p:127.0.0.1:$p"
+        got_ports="$got_ports $p"
     done
     [ "${#sshargs[@]}" -gt 0 ] || die "no ports available to forward"
 
@@ -2608,15 +2661,30 @@ cmd_forward() {
         # Detach stdio. A backgrounded process that keeps the caller's stdout
         # open leaves any script running `boxy forward --bg` waiting on the
         # pipe forever — the command "returns" but the shell never does.
+        #
+        # Appended, not truncated: with several tunnels up they share this log,
+        # and a new one must not erase the diagnostics of the one already there.
         local fwdlog; fwdlog="$(state_dir_for "$name")/forward.log"
         ssh -F "$cfg" -N -T -o ExitOnForwardFailure=yes "${sshargs[@]}" "$name" \
-            >"$fwdlog" 2>&1 </dev/null &
-        printf '%s\n' "$!" > "$pidfile"
-        ok "tunnelling$want_ports in the background (boxy forward $name --stop to end)"
+            >>"$fwdlog" 2>&1 </dev/null &
+        local newpid=$!
+        # Rewrite the record as "every tunnel still live, plus this one". The
+        # read has to finish before the file is replaced, hence the temp file:
+        # a plain >"$pidfile" would truncate it before forward_live_pids opens it.
+        local others; others="$(forward_live_pids "$name")"
+        {
+            if [ -n "$others" ]; then printf '%s\n' "$others"; fi
+            printf '%s\n' "$newpid"
+        } > "$pidfile.new"
+        mv "$pidfile.new" "$pidfile"
+        ok "tunnelling$got_ports in the background (boxy forward $name --stop to end)"
+        if [ -n "$others" ]; then
+            note "$(printf '%s\n' "$others" | wc -l | tr -d ' ') other tunnel(s) already up for $name — --stop ends all of them"
+        fi
         note "tunnel output: $fwdlog"
         return 0
     fi
-    info "tunnelling$want_ports — Ctrl-C to stop"
+    info "tunnelling$got_ports — Ctrl-C to stop"
     exec ssh -F "$cfg" -N -T -o ExitOnForwardFailure=yes "${sshargs[@]}" "$name"
 }
 
