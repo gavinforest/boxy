@@ -23,18 +23,20 @@ boxyboy@boxy-2:/work$
 
 ## Quick start
 
+Start by making sure Docker is installed, then
+
 ```bash
 ./boxy build          # boxy-base:latest + the egress sidecar (~7 min, 2.25 GB)
 ./boxy config --init  # writes ~/.config/boxy/config and the egress allowlist
 ./boxy create .       # mount the current directory at /work
-./boxy ls
-./boxy ssh boxy-1
+./boxy ls             # view all boxy instances
+./boxy ssh boxy-1     # ssh into boxy-1 (default first box)
 ```
 
-Put `boxy` on your `PATH`. A symlink is fine: boxy follows the link back to
+To put `boxy` on your `PATH`, you can use a symlink: boxy follows the link back to
 the real file before deciding where its own `Dockerfile`, `docker/` and
 `boxy.conf.example` live, so `boxy build` and `boxy config --init` read them
-from the repository rather than from wherever the link happens to sit.
+from the repository rather than from wherever the link happens to sit. For example:
 
 ```bash
 ln -s "$PWD/boxy" /usr/local/bin/boxy
@@ -44,7 +46,7 @@ See [TOUR.md](TOUR.md) for a more detailed walkthrough.
 
 ---
 
-## How it works
+## How it works & usage
 
 ```
    host                                     container
