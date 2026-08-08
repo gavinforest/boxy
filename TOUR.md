@@ -1,12 +1,10 @@
 # A tour of boxy
 
-Every block below is **real output** captured on an arm64 Mac against a live
-Docker daemon, not illustrative. Paths have been shortened from the throwaway
-test directory to `~/.local/share/boxy` for readability — that is where they
-land in normal use.
+Every block below is real output captured on an arm64 Mac against a live
+Docker daemon. Only the paths are edited: they came from a throwaway test
+directory and have been rewritten to `~/.local/share/boxy`, if they land there during normal use.
 
-Companion docs: [README.md](README.md) for reference, this file for the
-walkthrough.
+Companion docs: [README.md](README.md) for reference, [SECURITY.md](SECURITY.md) for security details, this file for the walkthrough.
 
 ---
 
@@ -26,7 +24,7 @@ image — keys, password hashes and proxy settings all arrive at
 ## 1. The surface
 
 Commands are grouped by whether they are boxy's own or a thin wrapper over
-docker — you asked, reasonably, which is which:
+docker:
 
 ```
 $ boxy --help
@@ -60,19 +58,17 @@ The name may be omitted whenever exactly one box exists.
 Full options: boxy create --help, boxy build --help
 ```
 
-Sidecars do not count toward that: a `--net limited` box brings a proxy
-container carrying the same `boxy.managed` label, and an earlier version
-counted it — so `boxy ssh` on a single limited box refused with
-"there are 2". Name-omission now counts boxes (`boxy.role=box`) only.
+"Exactly one box", in that last line, counts boxes rather than containers. A
+`--net limited` box runs a proxy sidecar beside it, but name-omission looks
+only at containers labelled `boxy.role=box`, so you can still leave the name
+off.
 
-The passthroughs earn their place by resolving the box name and supplying
-defaults you would otherwise have to remember — `boxy exec` sets the box user,
+The passthroughs are a convenience to resolve the box name and supply useful defaults  — `boxy exec` sets the box user,
 `$HOME` and `/work`; `boxy start` brings the sidecar up alongside the box and
-re-pins the host key. If you would rather not use them, the container name *is*
-the box name, so `docker logs boxy-1` works exactly as you would expect.
+re-pins the host key. It's ok not to use them, the container name is
+the box name, so `docker logs boxy-1` works exactly as you would expect. But just keep in mind that a box and its sidecar might get out of sync.
 
-`boxy doctor` says whether the machine is ready. It is deliberately relaxed
-about things created lazily:
+`boxy doctor` gives an overview of the `boxy` state and says whether the machine is ready to create a `boxy` instance. Some things are created lazily, and those are called out too:
 
 ```
 $ boxy doctor
@@ -91,9 +87,8 @@ boxy 1.0.0
 looks healthy
 ```
 
-What it does not check is whether an isolated box is still isolated. There is
-nothing to check: isolation is a property of the box's network rather than of
-the running container, so nothing can lose it. §7 goes into why.
+Running `boxy doctor -v` appends a full `boxy info` report for every box on the
+system.
 
 ---
 
@@ -118,7 +113,7 @@ created instance 1 (boxy-1), ssh at port 2200
 ~4 seconds from cold, including generating the keypair and downloading the
 wordlist. Subsequent creates take ~3s.
 
-### What landed on the host
+### What `boxy` creates on the host side
 
 ```
 ~/.local/share/boxy
@@ -136,15 +131,21 @@ the container — `boxy rm` deletes it. Your actual files are elsewhere: either
 the directory you named, the worktree boxy created, or a fresh scratch dir
 under `$TMPDIR/boxy/` when you named nothing.
 
-Note where the keypair is: **boxy's own state directory, not `~/.ssh`**. boxy
+Note that the keypair is in boxy's own state directory, not `~/.ssh`. boxy
 creates and manages this key, so it belongs with boxy's other state, where
 `rm -rf ~/.local/share/boxy` is a complete uninstall. Nothing boxy does writes
-to `~/.ssh` unless you explicitly run `boxy ssh-config --install`. Set
-`BOXY_SSH_KEY` if you would rather supply your own key.
+to `~/.ssh` unless you explicitly run `boxy ssh-config --install`. To supply
+your own key instead, point `BOXY_SSH_KEY` at the **private** half — boxy
+authorizes the `.pub` beside it and writes the private path into
+`IdentityFile`:
 
-### Where the state actually lives
+```bash
+BOXY_SSH_KEY=~/.ssh/id_ed25519 boxy create .   # authorizes ~/.ssh/id_ed25519.pub
+```
 
-There is no database. Docker labels are the single source of truth:
+### Where state lives
+
+Boxy uses Docker labels as the single source of truth:
 
 ```
 $ docker inspect boxy-1 --format '{{json .Config.Labels}}'
@@ -160,16 +161,13 @@ $ docker inspect boxy-1 --format '{{json .Config.Labels}}'
   boxy.workdir       /Users/gavin/code/demo
 ```
 
-boxy reads these with `docker inspect --format` (Go templates) — there is **no
-`jq` dependency**. `boxy ls` is a `docker ps` filter over the same labels.
-Delete a container by hand and boxy's view is instantly correct rather than
-stale; there is nothing to reconcile.
+boxy reads these with `docker inspect --format` (Go templates); `boxy ls` is a `docker ps` filter over the same labels. This means that `docker` commands don't require extra steps to maintain Boxy's state.
 
 ---
 
-## 3. The password, and where it isn't
+## 3. Container sudo passwords
 
-Four words from the EFF long (7776-word) list, ~51.7 bits:
+Container sudo passwords are four words drawn from the EFF long (7776-word) list, ~51.7 bits:
 
 ```
 $ boxy password boxy-1
@@ -179,7 +177,7 @@ $ ls -l ~/.local/share/boxy/instances/boxy-1/password
 -rw-------  ... password
 ```
 
-What the container actually received:
+What the container receives during creation:
 
 ```
 BOXY_AUTHORIZED_KEYS=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEDW9yM2gHDe3cFzsiyaguS00s94foRUHYlixT…
@@ -191,15 +189,20 @@ sha512-crypt hash crosses the boundary. The entrypoint feeds it to
 `chpasswd -e` and then unsets it, so it appears in no image layer, no
 `docker inspect`, and no `/proc/<pid>/environ`.
 
-Word selection uses rejection sampling against `/dev/urandom` rather than a
-plain modulo — `rand % 7776` over 16 bits quietly favours the first 1216 words,
-which is not a property you want in a password generator.
+Word selection for the password uses rejection sampling against `/dev/urandom` rather than a plain modulo to prevent bias.
 
-### The password gates sudo, and only sudo
+### The password gates sudo, not ssh
+
+Inside the box it is an ordinary sudo password. The box user is added to the
+`sudo` group at build time and no `NOPASSWD` rule is ever written, so `sudo`
+really does ask:
 
 ```
-without it : sudo: a password is required
-with it    : uid=0(root) gid=0(root) groups=0(root)
+$ boxy ssh boxy-1 -- 'sudo -n id'
+sudo: a password is required
+
+$ boxy ssh boxy-1 -- "echo $(boxy password boxy-1) | sudo -S id"
+[sudo] password for boxyboy: uid=0(root) gid=0(root) groups=0(root)
 ```
 
 `sshd` never accepts it: `PasswordAuthentication no`,
@@ -209,147 +212,174 @@ brute-forced into.
 
 ---
 
-## 4. Host keys are pinned, not trusted-on-first-use
+## 4. Host keys are written to `known_hosts`
 
-The `known_hosts` entry boxy wrote, and the key read straight off the
-bind-mounted state directory:
+If `boxy ssh-config --known-hosts` is called, `boxy` writes  `~/.ssh/known_hosts` entries so that connecting is easier (and it's required for Claude Code Desktop). For example:
 
 ```
 known_hosts:  [127.0.0.1]:2200 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXng2/CVus/zpHJAorQCcZ2T3KHwNaXakfEKwZpVVA4
 hostkeys/:                    ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXng2/CVus/zpHJAorQCcZ2T3KHwNaXakfEKwZpVVA4
 ```
 
-They match because `<state>/hostkeys` is bind-mounted into the container.
-boxy reads the box's public host key off the host filesystem and writes a real
-`known_hosts` entry *before you ever connect*. Result: full host-key
+They match because the source of truth, `<state>/hostkeys`, is bind-mounted into the container.
+If `boxy ssh-config --known-hosts` has been called, Boxy reads the box's public host key off the host filesystem and writes a real
+`known_hosts` entry (if `boxy ssh-config --known-hosts` has been called). Result: full host-key
 verification from the first connection — no TOFU prompt, no
-`StrictHostKeyChecking=no`, and the fingerprint survives `boxy restart`
-(verified).
+`StrictHostKeyChecking=no`, and the fingerprint survives `boxy restart`. 
+
+You only have to call `boxy ssh-config --known-hosts` once, and it'll keep boxy entries in your `~/.ssh/known_hosts` up to date for every future `boxy` usage; `boxy ssh-config --no-known-hosts` opts out of boxy managing this. Every time Boxy changes `~/.ssh/known_hosts`, it diffs the proposed and current `known_hosts`, and checks that every changed line contains the tag ` boxy:`.
 
 ---
 
-## 5. Inside a box
+## 5. Accessing a `boxy` container
 
-`boxy ssh <name>` with no trailing command gives you a **live interactive
-session** — a real login shell on a real PTY, not a wrapper:
+`boxy ssh <name>` with no trailing command gives you a real login shell over ssh, on a real PTY:
 
 ```
 $ boxy ssh boxy-1
-Linux boxy-1 6.12.76-linuxkit #1 SMP aarch64
+Linux boxy-1 6.12.76-linuxkit #1 SMP Tue Jul 21 14:38:37 UTC 2026 aarch64
 
   boxy: boxy-1
   workdir: /work   user: boxyboy
   python: Python 3.12.13
-  Bind servers to 0.0.0.0 (e.g. marimo edit --host 0.0.0.0) to reach them
-  from the host on published ports.
+  Bind servers to 0.0.0.0 (e.g. marimo edit --host 0.0.0.0) to reach
+  them from the host on published ports.
 
-(base) boxyboy@boxy-1:/work$ whoami
+boxy-1: (base) {4:45}/work $ whoami
 boxyboy
-(base) boxyboy@boxy-1:/work$ tty
+boxy-1: (base) {4:45}/work $ tty
 /dev/pts/0
-(base) boxyboy@boxy-1:/work$ echo $-
-himBHs
-(base) boxyboy@boxy-1:/work$ ls
+boxy-1: (base) {4:45}/work $ echo $0
+-zsh
+boxy-1: (base) {4:45}/work $ echo $-
+569XZilms
+boxy-1: (base) {4:45}/work $ ls
 notes.md  src
-(base) boxyboy@boxy-1:/work$ exit
-logout
+boxy-1: (base) {4:45}/work $ exit
 Connection to 127.0.0.1 closed.
 ```
 
-`/dev/pts/0` confirms a genuine pseudo-terminal and the `i` in `himBHs`
-confirms an interactive shell, so job control, `Ctrl-C`, `Ctrl-Z`, curses
-programs and window resizing all behave normally. `(base)` is the conda
-environment; the prompt shows you land in `/work`.
+Three things to call out from the above. `/dev/pts/0` is a genuine
+pseudo-terminal; the leading dash in `-zsh` marks a login shell; the `i` in
+`569XZilms` marks an interactive one. Together they mean job control, `Ctrl-C`,
+`Ctrl-Z`, curses programs and window resizing all behave normally. In the
+prompt itself, `(base)` is the active conda environment and `/work` is where
+you land.
 
-Internally `cmd_ssh` ends in `exec ssh …`, which **replaces** the boxy process
-rather than spawning a child. There is no shell sitting between you and the
-session — signals, exit codes and SSH's own `~.` escape sequences reach `ssh`
-directly, exactly as if you had typed the full command yourself.
+`boxy ssh` resolves the name, then finishes with `exec ssh -F <state>/ssh_config
+<name>` — it replaces itself with the `ssh` client rather than spawning one as a
+child. So no boxy process sits between you and the session: exit codes come back
+unchanged, `Ctrl-C` reaches the remote command, and SSH's own `~.` escape works,
+the same as if you had typed that `ssh` command yourself. That holds for both
+forms.
 
-Add a command and you get a one-shot, non-interactive run instead (no PTY,
-which is the right default for scripts and agents):
+Add a command and you get a one-shot, non-interactive run instead of a live interactive one. There is no PTY and no
+prompt: the command runs, its output comes back, and the connection closes —
+which is the mode scripts might want.
 
 ```
 $ boxy ssh boxy-1 -- tty
 not a tty
 $ boxy ssh boxy-1 -- pwd
 /work
+$ boxy ssh boxy-1 -- 'echo $0'
+zsh
 $ boxy ssh boxy-1 -- 'python -c "print(2**16)"'
 65536
 ```
 
-Both forms land in `/work`. Note that `/work` is a **directory** — the mount
-point for whatever you named, be it a directory or a worktree:
+Note the `$0`: `zsh` here, against `-zsh` in the session above. The leading
+dash is how a shell is told it is a login shell, so its absence means this one
+is not — which is the case "Environment variables the box sees" below is about.
+
+Both forms land in `/work`. Note that `/work` is a directory — the mount
+point for a temporary directory on the host, or whatever you named, be it a directory or a worktree:
 
 ```
-(base) boxyboy@boxy-1:/work$ stat -c %F /work
+$ boxy ssh boxy-1 -- 'stat -c %F /work; ls -la /work'
 directory
-(base) boxyboy@boxy-1:/work$ ls -la /work
-drwxr-xr-x 4 boxyboy boxyboy  128 .
--rw-r--r-- 1 boxyboy boxyboy   38 notes.md
-drwxr-xr-x 3 boxyboy boxyboy   96 src
+total 8
+drwxr-xr-x 4 boxyboy boxyboy  128 Aug  8 04:44 .
+drwxr-xr-x 1 root    root    4096 Aug  8 04:44 ..
+-rw-r--r-- 1 boxyboy boxyboy   13 Aug  8 04:44 notes.md
+drwxr-xr-x 3 boxyboy boxyboy   96 Aug  8 04:44 src
 ```
 
-Its contents are your host directory's contents, live in both directions.
-
-The stack:
+### What is in the default `base` image
 
 ```
   python   3.12.13
   jax      0.11.0 backend: cpu | devices: [CpuDevice(id=0)]
   numpy    2.5.1  scipy 1.18.0  pandas 3.0.5
-  polars   1.43.2  sklearn 1.9.0
-TODO: add gomp here
-  marimo      0.23.16
-  jupyter-lab 4.6.2
-  node        v26.5.1
-  npm         11.17.0
-  uv          0.12.1
-  conda       26.7.0
-  mamba       2.5.0
-  git         2.39.5
-  rg          13.0.0
-  claude      2.1.221 (Claude Code)
+  marimo   0.23.16
+  node       v26.6.0
+  npm        11.18.0
+  uv         0.12.2
+  conda      26.7.0
+  mamba      2.5.0
+  git        2.39.5
+  rg         13.0.0
 ```
 
-Real work, over SSH, non-interactively:
+`base` is what you get by default. The heavier variants add to it — Claude Code
+lives in `claude`, and `extras` and `full` pull in the rest of the usual
+scientific stack. Run `boxy images` to see which are built.
+
+Real work over that same one-shot form — no PTY, nothing interactive, just a
+command and its output:
 
 ```
-$ ssh boxy-1 'python -c "..."'
-  jit-compiled 512x512: 717.1864013671875
+$ boxy ssh boxy-1 -- 'python -c "..."'
+  jit-compiled 512x512: 134217728.0
   grad: 0.5403022766113281
 ```
 
-### Nothing needs sudo
+### Most things don't need sudo
+
+The three directories you actually work in all belong to the box user:
 
 ```
+$ boxy ssh boxy-1 -- 'stat -c "  %U:%G %n" /home/boxyboy /opt/conda /work'
   boxyboy:boxyboy /home/boxyboy
   boxyboy:boxyboy /opt/conda
   boxyboy:boxyboy /work
 ```
 
-```
-$ boxy ssh boxy-1 'pip install seaborn'
-  installed seaborn 0.13.2 into /opt/conda as boxyboy
-```
-
-The conda prefix is owned by the box user because everything is installed *as*
-that user at build time. The obvious alternative — `RUN chown -R` at the end —
-costs 3.44 GB, because Docker layers are copy-on-write per file and a metadata
-change rewrites every one of ~40k files into the new layer. Avoiding it took
-that build from **7.41 GB to 3.97 GB** — measured on a much fatter image than
-the one boxy ships now. Today's default build is **2.23 GB**; the saving is a
-property of the chown, not of the package list, so it still applies.
-
-### The volume is live in both directions
+So installing a package is just installing a package:
 
 ```
-  host -> box : # a file that was already on the host
-  box  -> host: the answer is 42
-  host dir    : notes.md results.txt
+$ boxy ssh boxy-1 -- 'pip install -q seaborn && python -c "import seaborn, os; ..."'
+  seaborn 0.13.2 -> /opt/conda/lib/python3.12/site-packages/seaborn
+  boxyboy owns /opt/conda
 ```
 
-### Environment variables the box actually sees
+The conda prefix is owned by the box user because everything is installed as
+that user at build time. The default build is **2.25 GB** as it stands.
+
+### The mounted directory is live in both directions
+
+A file written on the host is readable in the box immediately, and the reverse:
+
+```
+$ echo "written on the host" > ~/code/demo/from-host.txt
+$ boxy ssh boxy-1 -- 'cat /work/from-host.txt'
+written on the host
+
+$ boxy ssh boxy-1 -- 'echo "the answer is 42" > /work/results.txt'
+$ cat ~/code/demo/results.txt
+the answer is 42
+
+$ ls ~/code/demo
+from-host.txt  notes.md  results.txt  src
+```
+
+Neither direction copies anything: `/work` *is* that host directory, so there
+is no sync step to wait for and nothing to go stale.
+
+### Environment variables the box sees
+
+`boxy env` sets variables that persist for the life of the box and reach every
+way of getting into it — new ssh sessions, `boxy exec`, and one-shot commands:
 
 ```
 $ boxy env demo API_KEY=secret REGION=us-east-1
@@ -365,19 +395,26 @@ $ boxy ssh demo -- 'echo $API_KEY'
 secret
 ```
 
-`docker run -e` does not cover this. A variable set that way lands in PID 1's
+Boxy manages environment variables a bit differently from `docker run -e`. A variable set via `-e` lands in PID 1's
 environment, which the box's own processes and `boxy exec` inherit — but an ssh
 session does not, because sshd builds a fresh environment through PAM rather
 than inheriting PID 1's. And `-e` is fixed for the life of the container, so
 adding a variable would mean recreating the box.
 
-The awkward case is `ssh box cmd`, which reads no profile and no rc of its own.
-It works because bash sources `~/.bashrc` when sshd started it, and boxy's block
-sits at the *top* of that file — above the `case $- in *i*) ;; *) return;; esac`
-guard Debian ships, below which the non-interactive case returns before ever
-reaching it.
+So boxy keeps the variables in a file instead. `boxy env` writes
+`/etc/boxy-env` (plain `KEY=VALUE`, one per line) and the entrypoint installs a
+loader at `/etc/profile.d/boxy-env.sh` that reads it. Login shells run
+everything in `/etc/profile.d`, so an interactive `boxy ssh` is covered for
+free.
 
-There is no host-side copy and nothing replayed on start: the file lives in the
+The awkward case is `ssh box cmd`, which is neither a login shell nor an
+interactive one and so reads no profile at all. Boxy covers it through the
+box user's login shell: zsh reads `~/.zshenv` on *every* invocation, and boxy's
+block there sources `/etc/profile.d` by hand. (The entrypoint writes an
+equivalent block at the top of `~/.bashrc`, so the variables are still there if
+you switch the shell to bash.)
+
+There is no host-side copy of environment variables and nothing replayed on start: the file lives in the
 container, so it survives a restart untouched — and can be read back while the
 box is stopped, since boxy lifts it out with `docker cp` rather than needing
 anything running to ask:
@@ -388,7 +425,7 @@ API_KEY=secret
 REGION=us-east-1
 ```
 
-`PATH` and `BOXY_*` are refused — the first because replacing the box's own
+`PATH` and `BOXY_*` are refused — the first because replacing the box's own `PATH`
 breaks every command in it, the second because that is boxy's channel into the
 entrypoint:
 
@@ -420,10 +457,12 @@ scratch      running   2202   full     ~/.local/share/boxy/instances/scratch/wor
 boxy-1       running   2200   full     ~/code/demo
 ```
 
-### Reaching a service: two explicit mechanisms
+### Two ways to reach a service
 
-**`boxy forward`** keeps the number identical on both sides. This is the
-default path, and there is nothing to decode:
+**`boxy forward`** tunnels a port over ssh to the box, keeping the *same* number
+on the host: 8000 in the box is 8000 on your machine. This can be done at any
+time in the box's life cycle. (On an isolated box that ssh connection runs
+through the sidecar, which changes nothing here — §7 has the details.)
 
 ```
 $ boxy forward boxy-1 --bg 8000
@@ -436,11 +475,37 @@ $ boxy forward boxy-1 --stop
 stopped tunnel for boxy-1
 ```
 
-`--bg` records the ssh client's pid, and `--stop` checks that the pid is still
-that tunnel before signalling it. Worth doing because the record outlives a
-tunnel that died on its own — a dropped network, `ExitOnForwardFailure`, a
-reboot — and pids get recycled, so a blind `kill` could land on something else
-of yours. A tunnel that is already gone says so instead:
+`--stop` takes no port because one `--bg`
+tunnel per box carries every port, so stopping it stops them all.
+Ports are positional arguments — `boxy forward [NAME] [--bg|--stop] [PORT ...]`
+— and omitting them forwards boxy's default list.
+
+Asking for a port that is already tunnelled is refused, so running the same
+`--bg` command twice costs you nothing:
+
+```
+$ boxy forward boxy-1 --bg 8000
+warning: localhost:8000 is already in use — skipping
+error: no ports available to forward
+```
+
+> **A second `--bg` with *different* ports is a trap.** It starts a second
+> tunnel and overwrites the same `forward.pid`, so the record of the first one
+> is lost. `--stop` then ends only the newer tunnel; the older one keeps
+> serving its ports with nothing tracking it, and a second `--stop` reports
+> `no background tunnel recorded`. Forward every port you want in one command,
+> or clean up with `pkill -f "ssh -F.*<name>"`.
+
+The pid bookkeeping exists only because of `--bg`. Without it, `boxy forward`
+runs in the foreground and you stop it with `Ctrl-C`. With it, boxy starts
+`ssh -N -T` with its output redirected to `<state>/forward.log`, detaches it
+from the terminal and returns — leaving a plain background process that nothing
+is waiting on, so boxy records its pid in `<state>/forward.pid` to be able to
+find it again. But that tunnel can also die on its own — a dropped network,
+`ExitOnForwardFailure`, a reboot — which leaves the record pointing at a pid the
+OS is free to hand to something else. So `--stop` confirms the pid is still
+*that* tunnel before signalling it, rather than killing whatever now holds the
+number:
 
 ```
 $ boxy forward boxy-1 --stop
@@ -448,7 +513,9 @@ no tunnel running for boxy-1 — cleared a stale record (pid 59360)
 ```
 
 **`-p`** publishes, with exactly docker's semantics — a bare port means the
-same number, `HOST:CONTAINER` states it explicitly:
+same number, `HOST:CONTAINER` states it explicitly. It is a `boxy create` flag
+only: publishing is fixed when the container is made, whereas `boxy forward`
+works on a box that already exists.
 
 ```
 $ boxy create -n pub -p 28000:8000 -p 29999
@@ -457,22 +524,19 @@ published   localhost:28000 -> 8000   localhost:29999 -> 29999
 forwardable 2718 8888 8000 8080 3000 5000 6006   (boxy forward pub)
 ```
 
-A taken host port is an error before anything is created, not a silent remap:
+A taken host port causes an error before anything is created, not a silent remap:
 
 ```
 $ boxy create -n dup -p 28000:8000
 error: --publish 28000:8000: host port 28000 is already in use
 ```
 
-> An earlier version of boxy auto-published every port in `BOXY_PORTS` into a
-> per-instance 100-port block (`20000`, `20100`, …). It was removed: decoding
-> that `20002` meant `8000` required knowing the *ordering* of a config list,
-> which is a worse mapping than no mapping.
-
-> Servers must bind `0.0.0.0` to be reachable through a **published** port
-> (`marimo edit --host 0.0.0.0`). Binding `127.0.0.1` is fine over
-> `boxy forward`, since the tunnel terminates inside the container's own
-> loopback.
+> Servers in the box must bind `0.0.0.0` to be reachable through a port
+> published with `-p` (`marimo edit --host 0.0.0.0`). Docker forwards such a
+> port from the host into the container's network interface, and a server bound
+> to `127.0.0.1` is not listening there. Binding `127.0.0.1` is fine over
+> `boxy forward`, because that tunnel terminates *inside* the container, on the
+> same loopback the server is on.
 
 ---
 
@@ -484,15 +548,23 @@ boxy create --net none      # no route off the host
 boxy create --net limited   # allowlisting proxy only
 ```
 
-### How: Docker enforces it, boxy does not
+### How: Docker internal networks
 
-An isolated box sits **alone on a `docker network create --internal` network**.
-Docker installs no default route for it, no NAT rule for its subnet, and no
-external DNS. That is the entire mechanism.
+Isolated means **either** `--net none` **or** `--net limited` — both get the
+same treatment, and only `--net full` is different. Anything other than `full`
+puts the box alone with its sidecar on a `docker network create --internal`
+network. Docker installs no default route for it, no NAT rule for its subnet,
+and no external DNS. That is the entire mechanism for isolation. Container
+names on that network still resolve — that is how the sidecar finds the box —
+but no external name does.
 
-The property that matters is where the isolation *lives*. It is part of the
-network's definition, not state applied to a running container, so nothing has
-to be reapplied and nothing can be lost:
+The two modes differ only in what the sidecar does once it is there: under
+`--net none` it relays ports inward and nothing else, and under `--net limited`
+it also runs a proxy the box is allowed to reach.
+
+Isolation belongs to the network rather than to the running container, so no
+step has to be reapplied when a box restarts, and nothing done inside a box can
+lift it:
 
 ```
   ssh works on an isolated box       PASS
@@ -503,56 +575,48 @@ to be reapplied and nothing can be lost:
   the box binds no host ports        PASS
   external name resolution is dead   PASS   <- DNS covert channel, closed for free
   TXT lookups cannot smuggle data    PASS
-  still isolated after a raw restart PASS   <- see below
+  still isolated after a raw restart PASS   <- plain docker restart included
   box root cannot undo it            PASS   -> RTNETLINK: Operation not permitted
 ```
 
-### What this replaced, and why
+### Securing the sidecar against the box
 
-The first implementation kept the box on an ordinary bridge and **deleted its
-default route** by privileged exec. It worked, but the isolation then lived in
-the container's network namespace — which a restart rebuilds. A plain
-`docker restart`, exactly what the daemon does at startup under a restart
-policy, silently restored full connectivity:
+Docker will not bind a host port for a container whose only network is
+internal: `-p` is accepted and silently discarded — no error, an empty binding
+list, and `docker port` prints nothing. So the box itself publishes nothing,
+and a per-box sidecar holds its ports instead.
+
+Being on two networks is not by itself enough — what matters is the order the
+sidecar acquires them. It is created with `docker run --network boxy-egress
+-p …`, where `boxy-egress` is an ordinary bridge. At that moment its only
+network is a normal one, so Docker binds the host ports without complaint. Only
+*afterwards* does boxy run `docker network connect boxy-iso-<name>` to attach
+the box's internal network.
+
+Here are the two possible orders:
 
 ```
-after boxy start:      route: absent    by-IP: no egress      <- isolated
-after docker restart:  route: present   by-IP: HTTP 301       <- fully connected
+$ docker run -d --network some-internal-net -p 19999:80 …   # created on internal
+$ docker port <container>
+                                                            # nothing: discarded
+
+$ docker run -d --network bridge -p 19998:80 …              # created on a bridge
+$ docker port <container>
+80/tcp -> 0.0.0.0:19998
+$ docker network connect some-internal-net <container>      # attach internal after
+$ docker port <container>
+80/tcp -> 0.0.0.0:19998                                     # binding survives
 ```
 
-...while `boxy info` still reported `net none`. That bug is now impossible: the
-same `docker restart` leaves an internal-network box sealed.
+That leaves the sidecar as the one container on both networks, which makes it
+the obvious thing for a compromised box to attack.
 
-Two mechanisms went away with it, both of which existed only to patch holes
-that route-removal left open:
-
-**DNS.** Docker's embedded resolver forwards through the daemon, outside the
-container's netns, so an unrouted box still resolved names and `dig TXT` came
-back with real records — data out in query labels, back in answers. This
-needed a `--dns 127.0.0.1` override. An internal network resolves no external
-name at all, so the override is gone; container names still work, which is how
-the sidecar finds the box.
-
-**The on-link gateway.** Deleting a route only stops traffic that *needs* a
-gateway; the gateway itself is on-link, and a host-netns service answered 200
-from inside a "no network" box. That required a stateful `OUTPUT` firewall,
-installed by privileged exec. An internal network has no gateway to reach.
-
-### The sidecar, and why the box cannot attack it
-
-An internal network costs one thing: **Docker will not bind a host port for a
-container whose only network is internal.** `-p` is accepted and silently
-discarded — no error, an empty binding list, `docker port` prints nothing.
-
-So the box publishes nothing, and a per-box sidecar holds its ports. The
-sidecar is the only container on both the box's network and an ordinary
-bridge, which makes it the obvious thing for a compromised box to attack.
-
-It cannot, because traffic only ever flows host → sidecar → box. The sidecar
-never accepts a connection *from* the box, so its listeners bind to its
-outward address alone — the address on whichever interface owns the default
-route, since the box's internal network has none — and the private side is
-left bare. Probed from inside a box:
+It is a poor target, because traffic only ever flows host → sidecar → box. The
+sidecar never needs to accept a connection *from* the box, so its `socat`
+listeners are bound to one specific address: the sidecar's address on
+`boxy-egress`, the interface that owns its default route. Nothing is listening
+on the address the box can actually see — its side of `boxy-iso-<name>` — so
+from inside the box those ports are not filtered, they are simply not there:
 
 ```
 box -> sidecar:2200 (by IP)    REFUSED
@@ -562,13 +626,54 @@ default route via sidecar, then egress   BLOCKED
 ```
 
 It also runs with `--cap-drop=ALL` (`CapBnd:0000000000000000`) and
-`net.ipv4.ip_forward=0`, so there is nothing to escalate to and it cannot be
-made to forward. The one exception is `--net limited`, where the box *must*
-reach the proxy port — that is what `limited` means.
+`net.ipv4.ip_forward=0`, so there is nothing to escalate to and the kernel
+will not route through it. That is not the same as being unable to relay —
+see §13 — but it does mean the box gets no help from the sidecar's privileges.
+
+### Reaching a new port on an isolated box
+
+Because those host bindings are fixed when the sidecar is created, `-p` cannot
+add a port to an isolated box after the fact. `boxy forward` works by tunnelling over ssh through the one port the sidecar already binds.
+
+The `ssh` client on your machine connects to `127.0.0.1:2200`, a port the
+sidecar holds — so the TCP connection really is *to* the sidecar. But the
+sidecar's `socat` is a plain byte relay, `TCP-LISTEN:2200` spliced to
+`TCP:boxy-1:22`, copying bytes onto the internal network without decrypting or
+interpreting any of them. The SSH handshake, the authentication and the session
+all terminate at the *box's* sshd.
+
+`ssh -L 8000:127.0.0.1:8000` is therefore two things at once: a property of the
+`ssh` process on your machine, which listens on `127.0.0.1:8000` there, and an
+instruction to the box's sshd, which opens `127.0.0.1:8000` from inside the box
+and splices the two together over the tunnel. The port "expands" into a real
+connection once it reaches the box; in between it is a multiplexed channel
+inside the one encrypted stream already running through the sidecar.
+
+So the sidecar sees a single TCP connection and never learns that 8000 exists —
+which is exactly why no new host binding and no sidecar restart are needed. It
+behaves the same as on a `--net full` box, where no sidecar is in the path at
+all:
+
+```
+$ boxy create ~/code/demo --net none
+created instance 1 (boxy-1), ssh at port 2200
+  net     none (sidecar boxy-sidecar-boxy-1)
+
+$ boxy forward boxy-1 --bg 8000
+tunnelling 8000 in the background (boxy forward boxy-1 --stop to end)
+
+$ curl -o /dev/null -w '%{http_code}\n' localhost:8000
+200
+```
+
+This does not weaken the isolation. The tunnel carries traffic *into* the box
+over a connection the host opened; it gives the box no way out. The one
+exception is `--net limited`, where the box *can* reach the proxy port on the
+sidecar, which is what `limited` means.
 
 ### `--net limited`
 
-A per-box tinyproxy sidecar sits on both the box's subnet and a normal bridge,
+In this case, a per-box tinyproxy sidecar sits on both the box's subnet and a normal bridge,
 making it the single path out. It refuses any domain not in
 `~/.config/boxy/allowlist.txt`.
 
@@ -595,9 +700,8 @@ Face and the Anthropic API.
 
 ### Changing the policy without dropping the session
 
-The shared allowlist is read once, at create, and copied to a file of the box's
-own — so editing it affects the *next* box rather than rewriting the rules
-under boxes already running. To widen a box that is running, use `boxy allow`:
+The shared allowlist is read once, at create, and copied to a file on the sidecar — editing it on the host only affects the *next* box, rather than rewriting the rules
+for running boxes. To widen a box that is running, use `boxy allow`:
 
 ```
 $ boxy allow ltd example.com
@@ -606,23 +710,27 @@ this box only — ~/.config/boxy/allowlist.txt is unchanged, so new boxes are un
 live ssh sessions and forwards are untouched
 ```
 
-That last line is the difficulty the whole feature is about. The box's ssh port
-is carried by `socat` inside the very sidecar the proxy lives in, so restarting
-the sidecar would drop every session and forward it is holding. Instead the
-box's copy of the policy is bind-mounted **read only** into the sidecar, whose
-PID 1 is a supervisor rather than tinyproxy itself: on `SIGHUP` it rebuilds the
-filter and restarts *only* tinyproxy. Read only matters — a compromised sidecar
-cannot widen its own rules.
+Keeping ssh sessions alive is a source of complexity in Boxy's sidecar design.
+The box's ssh port is carried by `socat` inside the same sidecar the proxy
+lives in, so restarting the sidecar would drop every session and forward it is
+holding. Instead the box's copy of the policy is bind-mounted **read only**
+into the sidecar, whose PID 1 is a supervisor rather than tinyproxy itself: on
+`SIGHUP` it rebuilds the filter and restarts *only* tinyproxy. (It has to be a
+restart. tinyproxy compiles its filter once at startup, and its own `SIGHUP`
+handler re-reads the config file and then goes on enforcing the old policy.)
 
-tinyproxy has to be restarted rather than signalled, because it compiles its
-filter once at startup. It *has* a `SIGHUP` handler, but that only re-reads the
-config file: signal it directly and it logs `Reloading config file finished`
-while continuing to enforce the old policy.
+Two things make that read-only mount worth more than a gesture. The allowlist
+is the *only* input to the filter, so there is no second file to point at
+instead; and `socat` — the process on the receiving end of every inbound
+connection, and so the most exposed thing in the sidecar — is dropped to
+`nobody` with `setpriv`, specifically so a compromise there cannot kill
+tinyproxy and stand up an unfiltered proxy in its place. Full root inside the
+sidecar is a different matter, and §13 says so plainly.
 
-Entries are domains, not patterns — the filter is a list of regexes and only
+Entries in the allowlist are domains, not patterns. The filter is a list of regexes and only
 dots are escaped on the way in, so `[^q]*` would otherwise become
-`^(.*\.)?[^q]*$` and match everything. Every route into the list is checked
-against the same rule, `--allow` and the file included:
+`^(.*\.)?[^q]*$` and match everything. Every route into the list gets the same
+check, `--allow` and the file alike:
 
 ```
 $ boxy allow ltd '*.example.com'
@@ -631,12 +739,13 @@ error: allow: '*.example.com' — drop the '*.', subdomains are already included
 
 ---
 
-## 8. Using a box as a remote
+## 8. Using a box over ssh
 
 `boxy` regenerates a standalone `ssh_config` on every create/remove:
 
 ```
 # Generated by boxy 1.0.0 — regenerated on every create/rm.
+# Do not edit; put overrides in ~/.config/boxy/config.
 
 Host api
     HostName 127.0.0.1
@@ -650,13 +759,17 @@ Host api
     ServerAliveInterval 30
 ```
 
-```
-boxy ssh-config --install    # Include it from ~/.ssh/config
+Run the following once and `~/.ssh/config` will `Include` that file from then on:
+
+```bash
+boxy ssh-config --install
 ```
 
 After that, `ssh api` works from anything that speaks SSH — verified with
-`ssh`, `scp` and `rsync`. That is what lets Claude Code (or VS Code
-Remote-SSH) treat a box as an ordinary remote host.
+`ssh`, `scp` and `rsync` — which is what lets Claude Code or VS Code
+Remote-SSH treat a box as an ordinary remote host. Pair it with
+`boxy ssh-config --known-hosts` from §4 if the client insists on reading
+`~/.ssh/known_hosts` rather than the per-box file (Claude Desktop does this).
 
 `boxy exec` is the escape hatch that does not involve SSH at all:
 
@@ -669,8 +782,7 @@ exec as boxyboy, HOME=/home/boxyboy, cwd=/work
 
 ## 9. Monitoring
 
-`boxy top` reads straight from the daemon — no extra services, no retention,
-nothing to start first:
+`boxy top` reads straight from the daemon — no extra services and nothing to start first, but also no retention:
 
 ```
 $ boxy top
@@ -680,11 +792,7 @@ api       0.03%     12.93MiB / 7.75GiB   0.16%     14.1kB / 12.9kB
 boxy-1    0.04%     14.94MiB / 7.75GiB   0.19%     35.3kB / 34.8kB
 ```
 
-A Prometheus/Grafana stack used to live here to answer "what happened while I
-wasn't looking". It cost ~830 MB of images and four containers to answer a
-question that rarely comes up when the boxes are on the laptop in front of
-you, so it was removed with the rest of the remote-host machinery. `boxy top
---watch` covers the live case.
+`boxy top --watch` keeps it updating.
 
 ---
 
@@ -699,22 +807,23 @@ boxy logs --raw <name>       # without the control-character stripping
 boxy rm <name>
 ```
 
-`boxy logs` is `docker logs` of the box, which is the entrypoint's setup
-narration — host-key generation, authorized-keys install, password set,
-and isolation confirmed. It is the first place to look when a box misbehaves.
-Setup steps that can fail leave the box *running* rather than dead, so you can
-still get in and read why.
+`boxy logs` is `docker logs` of the box: the entrypoint's setup narration —
+host-key generation, authorized-keys install, password set, isolation
+confirmed. Look here first when a box misbehaves. A setup step that fails
+leaves the box *running* rather than dead, so you can still get in and read
+why.
 
-An isolated box's story is split across two containers, because the parts that
-can fail on the way in and on the way out both live on the sidecar. `--sidecar`
-(`-s`) reads that one: the ingress listeners it placed, the allowlist it
-compiled, and every domain it later refused. When a box says a request timed
-out and its own log has nothing to add, this is where the reason is.
+An isolated box's logs are split across two containers, because everything
+that can fail on the way into the box's network, or out of it, lives on the
+sidecar. Read the
+sidecar's half with `boxy logs --sidecar`. This contains the ingress listeners it placed, the allowlist it
+compiled, and every domain it later refused. When a request from the box times
+out and the box's own log has nothing to add, the reason should be here.
 
-That log answers "did something break". `-v` answers "what happened" — the
-per-connection audit trail for the ingress relay, kept in a file inside the
-sidecar so a dozen lines per connection never bury the faults. It is still
-readable after the sidecar has stopped, which is the case it exists for.
+The default `boxy logs` and `boxy logs --sidecar` logs answer "did something break". `--verbose` gives the
+per-connection audit trail for the ingress relay. It lives in a file inside
+the sidecar, so a dozen lines per connection never bury the faults, and it
+stays readable after the sidecar has stopped — the case it exists for. See [SECURITY.md](SECURITY.md) for notes on how these logs are stored and sanitized.
 
 ### Where your files live
 
@@ -724,15 +833,14 @@ boxy create worktree       # a fresh branch of the repo you are in
 boxy create                # fresh scratch dir in $TMPDIR/boxy/
 ```
 
-Given a path, that directory is mounted at `/work` as-is — never created,
-never moved, never deleted. Given nothing, boxy makes a fresh directory under
+Given a path, that directory is mounted at `/work` as-is — never created, moved, nor deleted. When given neither a path nor `worktree`, boxy makes a fresh directory under
 `$TMPDIR/boxy/<name>.XXXXXX` (`mktemp`, so a recreated box never inherits a
-previous one's leftovers) and then stops caring about it. Temp directories are
-the OS's job to reap.
+previous one's leftovers). Temp directories are left to 
+the OS to reap.
 
 ### `boxy rm`
 
-One behaviour, no flags, no prompt:
+One behaviour, no flags:
 
 ```
 $ boxy rm boxy-1
@@ -746,22 +854,27 @@ removed mine
 
 It deletes the container, the proxy sidecar and per-box network if there were
 any, and boxy's per-instance bookkeeping — host key, `known_hosts`, password
-file. None of that means anything once the box is gone.
+file. None of that means anything once the box is gone, and because `rm` cannot
+destroy any mounted files, any work in `/work` persists. Files stored outside
+`/work` — in `$HOME`, say — live only in the container's writable layer and
+**will** be deleted without a prompt.
 
-There is no `--purge` and no confirmation, because there is nothing to
-confirm: `rm` cannot destroy anything of yours. Your files are either in a
-directory you named, or still sitting in the temp area.
+If you are unsure whether a box has anything worth keeping outside `/work`,
+`docker diff` lists every path that container has added or changed since the
+image, and it works on a stopped container:
 
-> An earlier version kept that bookkeeping after `rm` so that recreating under
-> the same name would adopt the old host key and password. It was removed —
-> preserving credentials nobody asked to keep is not an undo, it is a second
-> lifecycle to reason about.
+```bash
+docker diff boxy-1 | grep -v '^C' | grep -v '^A /work'
+```
+
+Recreating a box under the same name gets a fresh host key and a fresh
+password; nothing is adopted from the removed one.
 
 ---
 
 ## 11. Container privileges
 
-Boxes run with a reduced capability set by default — 10 of Docker's 14:
+Boxes run with a reduced kernel capability set by default — 10 of Docker's default 14:
 
 ```
 $ boxy info boxy-1 | grep caps
@@ -775,10 +888,7 @@ cap_net_bind_service cap_net_raw cap_setgid cap_setuid cap_sys_chroot
 Dropped: `MKNOD`, `SETPCAP`, `SETFCAP`, `FSETID`. Nothing in a dev box has a
 plausible use for creating device nodes or editing capability sets.
 
-The set is tuned for **usability over provable minimality**, which is a
-deliberate choice given what these boxes are for. Each retained capability is
-retained because losing it produces a confusing failure rather than an honest
-one. The sharpest example, found by testing rather than reasoning:
+The set favours usability over provable minimality. Dropping further capabilities produced at least slightly confusing failures during testing. For example, when `NET_RAW` is not granted:
 
 ```
 $ ping -c1 127.0.0.1
@@ -788,15 +898,21 @@ exec /usr/bin/ping: operation not permitted
 `/usr/bin/ping` carries the file capability `cap_net_raw=ep`. The `e`
 (effective) bit means that when `NET_RAW` is outside the bounding set, `exec`
 of the binary fails outright — not a degraded ping, a binary that will not
-start, reporting an error that points nowhere near capabilities. `KILL` is the
-same story (`sudo pkill` silently fails without it), as are
+start, reporting an error that never mentions `NET_RAW`.
+
+The sharp part is that ping does not even need the capability. The image has
+`net.ipv4.ping_group_range = 0 2147483647`, so any process can already open the
+unprivileged ICMP datagram socket ping actually uses; no raw socket is
+involved. The failure comes entirely from the `e` bit being checked at `exec`,
+before the program runs and discovers it had another way. `KILL` is the same
+kind of story (`sudo pkill` silently fails without it), as are
 `NET_BIND_SERVICE` and `AUDIT_WRITE`.
 
 Verified still working under the reduced set: ssh login, sudo to uid 0, ping,
 binding port 80 as an unprivileged user, `pip install`, and `git commit`.
 
-`boxy create --caps docker-default` restores Docker's full 14 — the fastest way
-to rule capabilities in or out when something misbehaves. Note which is which:
+`boxy create --caps docker-default` restores Docker's full 14. This can help
+debug if kernel capabilities are causing issues. Note which is which:
 `minimal` is boxy's default, and `docker-default` names Docker's own set. The
 value used to be spelled `default`, which read backwards — it named the set you
 never got by default. That spelling is rejected outright, with an error naming
@@ -827,8 +943,19 @@ all suites passed
 
 287 assertions, all green. The suites run against a scratch `BOXY_STATE_DIR`
 under `$TMPDIR` with their own keypair, so they cannot touch a real install or
-your `~/.ssh` — though they *do* remove every boxy-managed container on the
-host, since a shared Docker daemon is the one resource they cannot sandbox.
+your `~/.ssh`.
+
+One warning: **running `./test/run.sh` removes every boxy-managed container on
+the host.** Stopping a box first does not save it; the purge matches stopped
+containers too. Your mounted directories are untouched, but the boxes
+themselves are gone.
+
+A test-only naming scheme would not fix this, because the suite is testing
+boxy's own behaviour rather than just its output. It has to run `boxy create`,
+which sets `boxy.managed=1` whatever the box is called, and several assertions
+are about *global* daemon state — "the name may be omitted when exactly one box
+exists" is only true, and only testable, when the daemon holds exactly one
+boxy box. A shared Docker daemon is the one resource the suite cannot sandbox.
 
 | Suite | Covers |
 | --- | --- |
@@ -840,18 +967,15 @@ host, since a shared Docker daemon is the one resource they cannot sandbox.
 
 ## 13. Known gaps
 
-- **boxy is local-only by design.** Tailscale, `--runtime runsc` (gVisor),
-  `BOXY_SSH_HOST` and the Prometheus/Grafana stack were all removed rather
-  than left in untested: each existed only for a VPS story, and code that
-  claims a capability it has never demonstrated is worse than no code. Boxy
-  only ever talks to `docker`, so `docker context create vps --docker
-  "host=ssh://…"` remains the obvious re-entry point if that changes.
+- **boxy is local-only by design.** There is no remote-host story — no
+  Tailscale, no `--runtime runsc` (gVisor), no `BOXY_SSH_HOST`, no metrics
+  stack. boxy only ever talks to `docker`, so `docker context create vps
+  --docker "host=ssh://…"` is the obvious re-entry point if you want one.
 - **JAX is CPU-only.** GPU needs a CUDA build target and `jax[cuda12]`
   (amd64 only).
-- **`--net limited`/`none` are guardrails, not a sandbox.** An isolated box
+- **`--net limited`/`none` are guardrails, not a pure sandbox.** An isolated box
   cannot reach the internet, the host, or another box. It *can* do whatever it
-  likes with what you handed it: the mounted directory is read-write, and the
-  allowlist constrains where you can talk rather than what you can say — a POST
+  likes with mounted directories. The allowlist for a  `--net limited` box constrains where you can talk rather than what you can say — a POST
   from a limited box reaches `api.github.com` and gets a real answer.
 - **A worktree box can rewrite your local git history.** It has the repo's
   object store mounted read-write, so it can move branches and delete objects.
@@ -861,9 +985,11 @@ host, since a shared Docker daemon is the one resource they cannot sandbox.
   somewhere around two to three dozen of them. A create that hits the ceiling
   fails with the daemon's own message and rolls back cleanly, but the ceiling
   is Docker's to raise (`default-address-pools` in `daemon.json`), not boxy's.
-- **The sidecar is a trust boundary, not a sandbox.** It is dual-homed and has
-  real internet access by design, so a compromised one relays the box out in
-  userspace — no capabilities and no kernel forwarding required. Under
-  `--net none` the box has no way to reach it, which is what actually protects
-  a sealed box; under `--net limited` the box must reach tinyproxy, so there
-  the surface is real. §7 and the README's security notes go into this.
+- **The sidecar is a trust boundary, not a sandbox.** It is dual-homed
+  (`boxy-egress`, an ordinary bridge with real internet access, and
+  `boxy-iso-<name>`, the box's internal network) by design, so a compromised
+  one can relay the box's traffic entirely in userspace: a process that reads
+  from one socket and writes to another needs no capabilities, and
+  `net.ipv4.ip_forward=0` only stops the *kernel* from routing, which such a
+  relay never asks it to do. Under
+  `--net none` the box has no way to reach the internet, which contains a `--net none` box even if it's compromised; under `--net limited` the box must reach tinyproxy, which is necessarily an attack surface in this design. §7 and [SECURITY.md](SECURITY.md) go into more detail.
