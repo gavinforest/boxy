@@ -4,7 +4,9 @@ Every block below is real output captured on an arm64 Mac against a live
 Docker daemon. Only the paths are edited: they came from a throwaway test
 directory and have been rewritten to `~/.local/share/boxy`, if they land there during normal use.
 
-Companion docs: [README.md](README.md) for reference, [SECURITY.md](SECURITY.md) for security details, this file for the walkthrough.
+Companion docs: [README.md](README.md) for reference, [DESIGN.md](DESIGN.md)
+for why things are built the way they are, [SECURITY.md](SECURITY.md) for the
+threat model. This file is the walkthrough.
 
 ---
 
@@ -221,11 +223,11 @@ known_hosts:  [127.0.0.1]:2200 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXng2/CVus/z
 hostkeys/:                    ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXng2/CVus/zpHJAorQCcZ2T3KHwNaXakfEKwZpVVA4
 ```
 
-They match because the source of truth, `<state>/hostkeys`, is bind-mounted into the container.
-If `boxy ssh-config --known-hosts` has been called, Boxy reads the box's public host key off the host filesystem and writes a real
-`known_hosts` entry (if `boxy ssh-config --known-hosts` has been called). Result: full host-key
-verification from the first connection — no TOFU prompt, no
-`StrictHostKeyChecking=no`, and the fingerprint survives `boxy restart`. 
+They match because the source of truth, `<state>/hostkeys`, is bind-mounted into
+the container. Boxy reads the box's public host key off the host filesystem and
+writes a real `known_hosts` entry from it. Result: full host-key verification
+from the first connection — no TOFU prompt, no `StrictHostKeyChecking=no`, and
+the fingerprint survives `boxy restart`.
 
 You only have to call `boxy ssh-config --known-hosts` once, and it'll keep boxy entries in your `~/.ssh/known_hosts` up to date for every future `boxy` usage; `boxy ssh-config --no-known-hosts` opts out of boxy managing this. Every time Boxy changes `~/.ssh/known_hosts`, it diffs the proposed and current `known_hosts`, and checks that every changed line contains the tag ` boxy:`.
 
@@ -444,6 +446,9 @@ Only SSH is published automatically: instance *N* gets `2200 + N - 1`.
 $ boxy create -n api
 created instance 2 (api), ssh at port 2201
   ports   none published — boxy forward api tunnels 2718 8888 8000 8080 ...
+
+$ boxy create -n scratch
+created instance 3 (scratch), ssh at port 2202
 ```
 
 `api` and `scratch` here are just names passed to `-n`; there are no built-in
